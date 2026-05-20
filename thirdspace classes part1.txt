@@ -1,0 +1,276 @@
+
+class Meta_critical_thinking():
+
+    def __init__(self):
+        self. general_formatting_instructions="each of the following tasks should be considered independently and formatted in less than x lines."
+        self.questions_for_revisioning_reasoning = {
+            CheckReasoning_objective = ("you have to determine the objective of this thought process",
+                                        " clarify the thought process",
+                                        "is the objective reasonable,feasible and actual"
+                                        "does your reasoning focus on the objective from beginning to end")
+
+        CheckReasoning_queryFormulation = ("Formulate the problem or query definition",
+                                           "are there alternative processes to think step by step and formulate the query based on them? if so you have to do it",
+                                           "could you divide the objective or query to smaller subqueries",
+                                           "Does the query have a unique correct answer or it has multiple reasonable answers",
+                                           "Does answering this query require returning one or multiple reality or it demands judgement"
+                                           )
+
+
+        CheckReasoning_Perspective = (
+            "your reasoning is demonstrated based on a perspective, explain your perspective, what are the intuitions behind this perspective, what are the weaknesses of this perspective?"
+            "what other perspectives require attention beside this perspective, consider their strengths and weaknesses, are the underlying assumptions behind these perspective considered in a fair way",
+            ""
+
+        )
+
+        CheckReasoning_assumptions = (
+        "each reasoning relies on some assumptions, what are the assumptions behind the reasoning",
+        "how does your assumptions shape your perspective",
+        "which assumptions are subjected to reasonable doubts")
+
+        CheckReasoning_evidences = (" each reasoning is based on the given data information , evidences in your prompt. evaluate how the relevant data supports this reasoning"
+                               "is it possible to have other explanations other than the current one based on the given data and evidences?"
+                               "to which extent the data are relevant to the discussion and answer and to which extent they are clear and correct"
+                               "do gathered data help for a reasonable results")
+
+        CheckReasoning_concepts_rules_theories = ("identify the key concepts and rules and theories that guide the reasoning"
+                                                "what other explications could we have using these theories rules, and  concepts on this scenario"
+                                                "Hav you have used concepts rules and theories on reasoning with clarity and precision? Make sure about it"
+                                                "havent you modified the assumptions to be compatible with the instruction? make sure about it")
+
+        CheckReasoning_interpretations_and_inferences = ("evaluate how the evidences are supporting your results?"
+                                                         "evaluate if your inferences compatible with each other?"
+                                                         "are there other reasonable inferences that need to be considered"
+
+                                                         )
+
+        CheckReasoning_implications = ("what does your reasoning  imply"
+                                       "if we validate and use this reasoning on the mentioned previous components, what are the possible implications?")
+                }
+
+
+        self.consolidator_instructions
+        {
+            'you are observing a person in the x environment as it had the experineces within the scenario,your goal is to help with critical thinking by constructing a summary of text_fields to assist the person in identifying each element'
+            ' your role is to merge or summarize previously found answers using revisioning reasoning elements as critical thinking, described above to have a formatted answer for elements by analyzing the reflection measures described bellow '
+            'you will be presented with a set of reflective measures, the reflections in which the critical context for the agent will be considered'
+            'you should alert the user if the reasoning is not valid.rewrite the attributes of an existing field when you come up with a better understanding'
+            'system.get node(epoch_ids)'
+            'you may need to check hte validation record of an existing data node to which which data node to get'
+            'retain important details: the onese that are validated with all relevant measures. '
+            'insertion is preferable: if some text field is updated to include the content of other ones, you shoild try to preserve the details of the existing content and preferably insert a categorical discussion or inserr new content to it (or its example)'
+
+        self.ThoughtReflectionMeasuresInstructions = {
+        self.clarity = ("explain more about it", "paraphrase it", "bring example", " explain with examples")
+        self.correctness = ("is it really accurate? how can we evaluate it", "how can we know if its honest or not")
+        self.preciseness("Could you bring more details", "could you be more explicit")
+        self.proportion = ("how is it related to the problem or question", "how does it affect the results")
+        self.depth = ("how does it address the complexities", "have you considered the difficulties ?how?",
+                      "have you considered  the causes the most important causes?")
+        self.comprehensiveness = (
+        "do we need other perspectives?", "is there any other way to look at it", f"how does it seem from perspective"
+        :{perspective.2f})
+        self.logic = (f"Does what has been observed by "
+                      :{observation.2f} "really imply this result", "is it really sound?")
+        self.fairness = ("are all the related perspectives have been considered in a justified way? ",
+                         "dont we alter  some information to maintain a biased prerspective? ",
+                         "Don't you hallucinate?")
+        }
+
+    def meta_critical_thinking_steps(self, ):
+        #algorithm formulation:
+
+    #enhancing trustworthiness and explainability step for conforming continuation wihtout user interventions on scenario and pov
+        #query passes to scenario and query response gets updated
+        #all new observations updates conformist pov
+        #expansions on first response, happens by related categories of check_reasoning and reflections,> memory*
+
+
+    # enhancing trustworthiness and explainability step for user intervention on auxilary pov, scenario, query or with auxilary pov
+        #user observes and updates scenario
+        #user observes memory and updates pov*
+        #get all user interventions
+        #for aux in auxilary_queries
+            # challenging reactors: expansion on response
+            #pov gets updated with some checking reasoning and doing reflections, > memory *
+
+
+        #Memory gathers all related useful observations for meta agent>memory*
+
+    #optimizing the synthesis for ideal response based on all different observations
+        # cdd optimization acts on clarified precise related fields in pov >memory returns*
+        # pov dynamically interacts with user,
+        #new pov passes to scenario and query response gets updated
+
+
+    def asking_all_critical question(self, reasoning_explanatory_response_observations={},default_critical_q_cats ): #ensuere precision and clarity
+        #there might be multiple of such questions.
+
+
+            instruction= """pass critical question categories, format questions, and expect to get formatted answer""""
+            self.Call_LLM
+            def update_memory_field_Q_responses_by_category
+                return related_responses
+    def helpful_instructions_for_practical_interpretations(self, default_related_categories, user_related_categories, logs):
+
+            instruction_gathering = """related observations_categories""""
+        def gather_related_observations(self):
+
+            instruction= """helpful_instructions_prompt_engineering_for_practical_interpretations"""
+
+
+
+
+
+
+        ## obtained from the grand instructions formatted into two sets: explanatory, and yes/no checking answers
+
+            check_reasoning[reflector][answer]
+            reflector[check_reasoning][answer]
+
+            extract_POV(item)
+
+
+        }}
+
+
+    def read(self):
+    def write(self):
+            CDD_optimize_log(constraintConcept, updated_assumptions, objective,)
+            """given that """{persona, objective, perspective, constraintConcept, updated_assumptions}
+
+            call_LLM( initial_task, persona, perspective, updated_assumptions, args)
+
+    def update_assumptions()
+    def update_objective()
+    def update_constraintConcept()
+    def wiring(self, reactor, reflector, ReflectionMeasuresInstructions):
+
+
+
+
+
+
+
+
+
+
+class information_nodes_graph_structure(): \# its a structured memory that maintains state, and could be used in agent reasoning.
+
+    def __init__(self):
+        self.input={
+        self.node_query
+        self.node_occuring
+        #self.node_persona_actor
+        #self.node_style_actor
+        self.node_challenger_perspective
+        }
+        self.get_result(Meta_critical_thinking.consolidator_instructions) #wither for past cycle, for effectiveness comparison with first term: first and naive pass(no interaction with child nodes). versus subsequent cycles where child nodes communicate.
+
+        self.parts_of_occuring ={ #need elaborate prompting for each reasoning
+
+            # The single occurring includes all the differences, and the differences made
+            # to each other by these differences, and again by the differences they make.
+            # #The point is that there is a result. All differences having made their differences, the result is what it is.
+
+            self.other_individual_entities_as_already_affected_by
+        self.affected_by_individuals_persona
+        self.interactionalEvent
+        self.process_events_and_model_of_time
+        self.evidence_and_data_viability_of_factors_shaping_one_event
+        self.concept_theories_rules
+        self.inference_based_on_data_evidence_on_units_emerging_or_reemerging
+        }
+
+        self.call_reasoning(Meta_critical_thinking.questions_for_revisioning_reasoning,  )#its important how clean you write these reasoning interconnection function(edge) between what passes between information nodes graph
+        self.eveving{
+        self.evaluating_results__after_applying_reasoning_measures(self.input, self.parts_of_occuring) # child nodes involve.
+        self.updating occuring_assumptions
+        self.auxilary_reason_based_queries}
+
+        self.challenger_nodes()#predefined templates that follow commonsense within finetuned LLM, which later obtain input from users.
+        self.call_challenger_interventions(challenger_nodes)#challenger coudl be user or template instructions.
+        self.evaluating_results__after_applying_challenger_measures(evaluator_instructions)  # child nodes involve.
+        self.eveving_after_challenger
+        {
+        self.evaluating_results__after_applying_reasoning_measures(challenger_nodes, challenged_nodes_of_input_child_id, challenged_nodes_of_input_child_id, reasoning_measures )  # child nodes involve.
+        self.updating_occuring_assumptions#occuring updates; assumptions could be the critical_Context
+        self.auxilary_reason_based_queries #auxilary queries emerge
+
+        self.wholeness_implying_nodes={# #constrained context:what are the implications on constraints of important nodes.
+        self.query_assumptions#assumptions could be the critical_Context
+        self.reformulated_query
+        self.new_objective
+        self.updated_challenger_perspective
+        self.objective_assumptions
+        self.perspective_assumptions
+        }}
+
+        #there is a path in the graph that updates certain data nodes, when we call getting results, it prepares for next cycle.
+
+
+        self.implications(self,self.updating_occuring_assumptions, self.reformulated_query, self.new_objective, self.updated_challenger_perspective)
+
+
+        }
+
+        self.relevance_nodes{self, )
+
+            #crossing occurs here
+
+            [self.wholeness_implying_nodes, self.eveving]=self.evaluating_results__after_applying_reasoning_measures(self.input, self.parts_of_occuring)
+            self.relevant_critical_context = self.relevance(self.wholeness_implying_nodes, self.eveving)
+        #those that participate in constraint
+            #eveving and focaling
+        }
+
+        self.implication()
+        self.Challenger....
+
+
+        def relevance(self):
+        #instruction?
+
+        def critical_thinking_elements():
+            "within this general scenario"+ str(occuring)+str(input)+"I want you focus on this element of occuring"+ str(occuring element)
+            +"I wnat you consider these critical thinking reasoning check" + str()+ "with this final query"+ str()+"to obtain the following element"+
+            +str(critical_thinkin_element)
+
+            ##check if this element exists and is applicable.
+
+
+
+
+
+
+
+
+
+
+
+
+class BaseActorStep(Enum):
+
+    Occuring="""situation scaffold:
+        (1) Interaction first. The interactional event determines the individual
+         entities (or the “slots” for individual entities). Each functions
+         “not as itself but as already affected by.”
+         (2) A model of time in which a past and an implying function in
+         the present
+         (3) Process events
+         (4) A non- Laplacian sequence
+         (5) Many factors shaping one event
+         (6) Units emerge, and can reemerge differently
+         query: how a specific unit emerge or reemege differently?/ how should a specific events be processed?/ what is the reasonable subsequent action for an individual entity/
+         """
+
+    Input='situation+query+persona+style'
+    Wire_reflector_instructions='pov, observations'
+    THOUGHT = "Thought"
+    OBSERVATION = "Observation"
+    ACTION_wheel = "Action-interact with other POVs such as challengers, contradictions or set intersections will be reported"
+
+    Wire_check_reasoning_measures_instructions= 'call memory, and other agents pov using measure instructions'
+    CRITICAL_CONTEXT = 'criticContextForThisAgent for constrained generation'
+    Coordinating_POV= 'constrained generation with discrete diffusion model'
