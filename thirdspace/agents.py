@@ -6,12 +6,16 @@ from concurrent.futures import ThreadPoolExecutor
 from langsmith import traceable
 from langsmith.run_helpers import get_current_run_tree
 
+from collections import Counter
+
 from models import (
     TheOccurring, OccurringNode,
     NodeReasoningGrid, NodeDimensionCell, ReflectionFlag,
     ImplyingNodes, CellConflict, WholenessImplyingNodes,
     JudgeScore,
     FACET_LIST, DIMENSION_LIST, NUM_FACETS, NUM_CELLS,
+    ConflictTypeSummary,
+    CONFLICT_TYPE,
 )
 from llm import (
     call_llm, call_llm_json, call_llm_json_with_refinement,
@@ -22,7 +26,7 @@ from llm import (
     challenger_cell_system, challenger_cell_user,
     NODE_UPDATE_SYSTEM, node_update_user,
     MEDIATION_SYSTEM, mediation_user,
-    CONSTRAINED_GENERATION_SYSTEM, constrained_generation_user,
+    build_constrained_generation_system , constrained_generation_user,
     judge_system, judge_user, judge_cycle_user,
 )
 from budget import active_memory, get_active_memory
@@ -331,20 +335,19 @@ def run_mediation(
 ) -> ImplyingNodes:
     occurring_json = occurring.model_dump_json()
 
-    cell_pairs = []
+    # Nest by facet instead of flat list — easier for LLM to scan
+    cell_pairs_by_facet: dict = {}
     for facet in FACET_LIST:
+        cell_pairs_by_facet[facet] = {}
         for dimension in DIMENSION_LIST:
             main_cell = main_grid.get_cell(facet, dimension)
             chall_cell = challenger_grid.get_cell(facet, dimension)
-            cell_pairs.append({
-                "facet": facet,
-                "dimension": dimension,
+            cell_pairs_by_facet[facet][dimension] = {
                 "main": main_cell.content if main_cell else "",
                 "challenger": chall_cell.content if chall_cell else "",
                 "response_type": chall_cell.response_type if chall_cell else None,
-            })
-
-    cell_pairs_json = json.dumps(cell_pairs, ensure_ascii=False)
+            }
+    cell_pairs_json = json.dumps(cell_pairs_by_facet, ensure_ascii=False)
 
     raw_history = [m.model_dump() for m in all_mediation_history]
     compressed = compress_historical_context(raw_history)
@@ -359,19 +362,30 @@ def run_mediation(
             cycle=cycle,
         ),
         max_tokens=16000,
+        temperature=0.1,
     )
 
-    conflicts = [
-        CellConflict(
-            facet=c["facet"],
-            dimension=c["dimension"],
-            main_summary=c["main_content"],
-            challenger_summary=c["challenger_content"],
-            challenger_response_type=c.get("response_type", "challenge"),
-            implication=c["implication"],
-        )
-        for c in result.get("conflicts", [])
-    ]
+    conflicts: list[CellConflict] = []
+    for c in result.get("conflicts", []):
+        try:
+            conflicts.append(CellConflict(
+                facet=c["facet"],
+                dimension=c["dimension"],
+                main_summary=c.get("main_content", ""),
+                challenger_summary=c.get("challenger_content", ""),
+                challenger_response_type=c.get("response_type", "challenge"),
+                implication=c["implication"],
+                conflict_type=c["conflict_type"],
+                conflict_type_rationale=c.get("conflict_type_rationale", ""),
+                severity=c.get("severity", 3),
+                resolvability=c["resolvability"],
+            ))
+        except Exception as exc:
+            logger.warning(
+                f"[run_mediation cycle={cycle}] Skipping invalid conflict "
+                f"({c.get('facet')}, {c.get('dimension')}): {exc}"
+            )
+
 
     w = result.get("wholeness", {})
     wholeness = WholenessImplyingNodes(
@@ -474,27 +488,68 @@ def run_constrained_generation(
     mediation_history: list[ImplyingNodes],
     evaluation_feedback: str | None = None,
 ) -> str:
+    if not mediation_history:
+        raise ValueError(
+            "run_constrained_generation requires at least one completed mediation cycle."
+        )
+
     distilled = [m.wholeness.model_dump() for m in mediation_history]
     final_mediation = mediation_history[-1]
 
-    # Slide 8: output is bound by implications gathered across the ENTIRE
-    # mediation cycle, not just the final one. Aggregate findings from every cycle.
     all_implications: list[str] = []
     for m in mediation_history:
         all_implications.extend(m.what_conflicts_imply)
         all_implications.extend(c.implication for c in m.conflicts)
     all_findings_json = json.dumps(all_implications, ensure_ascii=False)
 
+    # Cross-cycle conflict type summary
+    all_conflicts = [c for m in mediation_history for c in m.conflicts]
+    cross_cycle_summary: ConflictTypeSummary | None = None
+    if all_conflicts:
+        counts: Counter[str] = Counter(c.conflict_type for c in all_conflicts)
+        total = len(all_conflicts)
+        dominant = counts.most_common(1)[0][0]
+        cross_cycle_summary = ConflictTypeSummary(
+            semantic=counts.get("semantic", 0),
+            attributional=counts.get("attributional", 0),
+            normative=counts.get("normative", 0),
+            structural=counts.get("structural", 0),
+            factual=counts.get("factual", 0),
+            total=total,
+            dominant_type=dominant,
+            structural_fraction=counts.get("structural", 0) / total,
+            conversational_fraction=sum(
+                1 for c in all_conflicts if c.resolvability == "conversational"
+            ) / total,
+            unresolvable_fraction=sum(
+                1 for c in all_conflicts if c.resolvability == "unresolvable"
+            ) / total,
+            structural_severity_score=sum(
+                c.severity for c in all_conflicts if c.conflict_type == "structural"
+            ) / (5 * total),
+        )
+
+    salient = sorted(
+        [c for c in all_conflicts if c.severity >= 3],
+        key=lambda c: c.severity, reverse=True,
+    )
+
     return call_llm(
-        system=CONSTRAINED_GENERATION_SYSTEM,
+        system=build_constrained_generation_system(cross_cycle_summary),
         user=constrained_generation_user(
             occurring_json=occurring.model_dump_json(),
             distilled_wholeness_json=json.dumps(distilled, ensure_ascii=False),
             final_mediation_json=final_mediation.model_dump_json(),
             all_findings_json=all_findings_json,
+            conflict_type_summary_json=(
+                cross_cycle_summary.model_dump_json() if cross_cycle_summary else "null"
+            ),
+            salient_conflicts_json=json.dumps(
+                [c.model_dump() for c in salient], ensure_ascii=False
+            ),
             evaluation_feedback=evaluation_feedback,
         ),
-        temperature=0.0
+        temperature=0.5,
     )
 
 
@@ -523,6 +578,7 @@ def run_judge(
         consensus=result["consensus"],
         escalation_risk=result["escalation_risk"],
         cultural_insight=result["cultural_insight"],
+        intervention_fidelity=result["intervention_fidelity"],
         reasoning=result["reasoning"],
     )
 
@@ -547,5 +603,6 @@ def run_cycle_judge(
         consensus=result["consensus"],
         escalation_risk=result["escalation_risk"],
         cultural_insight=result["cultural_insight"],
+        intervention_fidelity=result["intervention_fidelity"],
         reasoning=result["reasoning"],
     )
