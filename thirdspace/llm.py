@@ -767,36 +767,67 @@ THE OCCURRING (full context):
 MEDIATION_SYSTEM = """\
 You are the mediation engine in a cultural conflict analysis system.
 
-You receive a compact comparison of cell pairs from two agents and The Occurring.
-Compare all pairs. For each: agreement or conflict?
+For each cell pair: AGREEMENT or CONFLICT.
 
-For conflicts — the IMPLICATION field is critical.
-Do not write "they disagree about silence."
-Write what the disagreement REVEALS about the conflict.
-Complete: "This reveals that [structural feature invisible from inside either frame]."
+For CONFLICT — complete all five sub-tasks:
 
-Weak: "The two agents have different views on communication."
-Strong: "This reveals that both parties believed they were being clear — the
-breakdown happened at the layer of what being clear means, not intention."
+────────────────────────────────────────────────────────
+A1  IMPLICATION
+────────────────────────────────────────────────────────
+Begin with "This reveals that..." and name a structural feature invisible
+from inside either frame. Do not restate the disagreement.
 
-PATTERN-LEVEL SYNTHESIS:
-After all pairs, look at where conflicts cluster.
-What does the distribution tell you that no individual conflict reveals?
-Goes in what_conflicts_imply.
+────────────────────────────────────────────────────────
+A2  CONFLICT TYPE — work through in order, stop at the first Yes
+────────────────────────────────────────────────────────
+STEP 1 FACTUAL: Are both parties disputing what actually happened —
+  the observable sequence of events — rather than what it means?
+  YES → conflict_type = "factual"
 
-ASSUMPTION UPDATES:
-Name the specific node and the specific assumption to replace.
-Not "update communication assumptions" but
-"individuals node: remove [X] → replace with [Y]."
+STEP 2 SEMANTIC: Do both parties use the same word with different operational
+  meanings, and would a jointly constructed definition eliminate the
+  disagreement entirely?
+  YES → conflict_type = "semantic"
 
-CONVERGENCE:
-converged=true only if conflicts this cycle are not meaningfully different
-from the previous cycle. Same tensions re-appearing = converged.
-New facet of conflict appearing = not converged.
+STEP 3 NORMATIVE: Do both parties fully understand each other AND would
+  neither change their position with more information?
+  YES → conflict_type = "normative"
+
+STEP 4 STRUCTURAL: Would this conflict reproduce between ANY two people in
+  these roles, with these cultural frames, regardless of who they are?
+  YES → conflict_type = "structural"
+
+STEP 5 DEFAULT → conflict_type = "attributional"
+
+────────────────────────────────────────────────────────
+A3  RATIONALE — one sentence citing which step fired and what evidence
+────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────
+A4  SEVERITY — 1=surface  3=significant  5=load-bearing
+────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────
+A5  RESOLVABILITY — must be consistent with conflict_type
+────────────────────────────────────────────────────────
+  structural    → MUST be: structural_change | external_standard | unresolvable
+  normative     → MUST be: facilitated | structural_change | external_standard | unresolvable
+  factual       → MUST be: structural_change | external_standard | unresolvable
+  semantic      → conversational | facilitated
+  attributional → facilitated | conversational
+
+AFTER ALL PAIRS — pattern-level synthesis in what_conflicts_imply.
+Reference the TYPE DISTRIBUTION: what does the dominant type reveal that
+no single conflict shows?
+
+ASSUMPTION UPDATES: "node: remove [exact text] → replace with [exact text]".
+
+CONVERGENCE: converged=true only if the conflict type distribution is not
+meaningfully different from the previous cycle and no new (facet, dimension)
+conflicts appeared.
 
 Respond ONLY with valid JSON. No preamble. No markdown fences.
 """
-
 
 def mediation_user(
     occurring_json: str,
@@ -810,41 +841,47 @@ Mediate between the two grids. Cycle {cycle}.
 THE OCCURRING:
 {occurring_json}
 
-CELL-BY-CELL COMPARISON (all pairs):
+CELL-BY-CELL COMPARISON (nested by facet):
 {cell_pairs_json}
 
-PRIOR MEDIATION HISTORY (compressed — null on cycle 1):
+PRIOR MEDIATION HISTORY (compressed):
 {compressed_history_json}
 
-Return:
+Return exactly this JSON:
 {{
   "cycle": {cycle},
-  "agreements": ["<what both agents agreed on>"],
+  "agreements": ["<what both frames reached in common>"],
   "conflicts": [
     {{
       "facet": "<facet>",
       "dimension": "<dimension>",
-      "response_type": "challenge" | "reframe" | "confirm",
-      "main_content": "<brief summary of main agent>",
-      "challenger_content": "<brief summary of challenger>",
-      "implication": "<This reveals that...>"
+      "response_type": "challenge | reframe | confirm",
+      "main_content": "<2-3 sentence summary>",
+      "challenger_content": "<2-3 sentence summary>",
+      "implication": "<This reveals that...>",
+      "conflict_type": "<semantic|attributional|normative|structural|factual>",
+      "conflict_type_rationale": "<one sentence citing the diagnostic step>",
+      "severity": <1-5>,
+      "resolvability": "<conversational|facilitated|structural_change|external_standard|unresolvable>"
     }}
   ],
-  "what_conflicts_imply": ["<pattern-level finding>"],
-  "updated_assumptions": ["<node>: remove [X] → replace with [Y]"],
+  "what_conflicts_imply": ["<pattern-level finding referencing type distribution>"],
+  "updated_assumptions": ["<node: remove [X] → replace with [Y]>"],
   "wholeness": {{
-    "query_assumptions": ["<assumption embedded in how the question was framed>"],
-    "reformulated_query": "<clearer question or null>",
-    "new_objective": "<revised objective or null>",
-    "updated_challenger_perspective": "<adjustment to challenger frame or null>",
-    "objective_assumptions": ["<assumption behind the stated objective>"],
-    "perspective_assumptions": ["<assumption behind the cultural frame>"]
+    "query_assumptions": [],
+    "reformulated_query": null,
+    "new_objective": null,
+    "updated_challenger_perspective": null,
+    "objective_assumptions": [],
+    "perspective_assumptions": []
   }},
-  "converged": true or false
+  "converged": true | false
 }}
 
-converged=true ONLY if this cycle's conflicts are not meaningfully different
-from the previous cycle. New tensions = NOT converged.
+CONSISTENCY ENFORCEMENT:
+  structural resolvability MUST NOT be conversational or facilitated.
+  normative resolvability MUST NOT be conversational.
+  factual resolvability MUST NOT be conversational or facilitated.
 """
 
 
@@ -948,35 +985,82 @@ For untouched nodes, copy content and assumptions verbatim from the input.
 # Phase 5 — Constrained generation prompts
 # ---------------------------------------------------------------------------
 
-CONSTRAINED_GENERATION_SYSTEM = """\
+def build_constrained_generation_system(summary: "ConflictTypeSummary | None") -> str:
+    from models import INTERVENTION_CLASS
+
+    if summary is None or summary.total == 0:
+        forward_section = (
+            "HOW TO MOVE FORWARD\n"
+            "Grounded only in updated_assumptions and new_objective from mediation. "
+            "If the conflict is structural, say so explicitly. "
+            "Do not offer dialogue as a remedy for structural or normative conflicts."
+        )
+    else:
+        type_order = ["structural", "normative", "factual", "attributional", "semantic"]
+        present = [t for t in type_order if getattr(summary, t, 0) > 0]
+
+        type_blocks = []
+        for t in present:
+            count = getattr(summary, t)
+            type_blocks.append(
+                f"  ── {t.upper()} CONFLICTS ({count} found) ──\n"
+                f"  {INTERVENTION_CLASS[t]}"
+            )
+
+        structural_warning = ""
+        if summary.structural_fraction >= 0.30:
+            pct = int(summary.structural_fraction * 100)
+            structural_warning = (
+                f"\n\n  ══ CRITICAL — {pct}% OF CONFLICTS ARE STRUCTURAL ══\n"
+                f"  State explicitly that conversational remedies are insufficient. "
+                f"Name the specific institutional constraints. Name who holds authority to change them.\n"
+                f"  PROHIBITED: Do not recommend dialogue for structural conflicts."
+            )
+
+        unresolvable_note = ""
+        if summary.unresolvable_fraction > 0:
+            pct = int(summary.unresolvable_fraction * 100)
+            unresolvable_note = (
+                f"\n\n  ── UNRESOLVABLE CONFLICTS ({pct}%) ──\n"
+                f"  Name these as unresolvable. Explain what conditions would be needed. "
+                f"Do not offer hollow forward-looking recommendations."
+            )
+
+        forward_section = (
+            "HOW TO MOVE FORWARD\n"
+            "Write a SEPARATE paragraph for each conflict type present. Do NOT merge them.\n\n"
+            + "\n\n".join(type_blocks)
+            + structural_warning
+            + unresolvable_note
+        )
+
+    return f"""\
 You are the final output writer in a cultural conflict analysis system.
 
 YOUR CONSTRAINT:
 Every claim must trace back to something the mediation process found.
-No new inferences. No advice from training data. No generic cultural wisdom.
-If mediation did not produce enough to ground a claim, say so.
+No new inferences. No advice from training data.
+If mediation did not produce enough to ground a claim, say so explicitly.
 
-FIVE SECTIONS:
+FIVE SECTIONS — write in this order:
 
 WHAT ACTUALLY HAPPENED
-The mediation's version, not the user's version. 2-3 paragraphs.
+The mediation's reconstruction, not the narrator's version.
+Begin with the most structurally significant finding.
 
 WHERE THE CULTURES DIVERGED
-For each significant conflict: what each frame expected, why neither is wrong,
-what the specific misread was. Choose conflicts with the strongest implications.
+For each conflict with severity >= 3: what each frame expected, why neither is
+wrong, what the specific misread was, and the conflict TYPE.
+Name structural conflicts as structural. Do not soften them as "misunderstandings."
 
 WHAT THE CONFLICT ACTUALLY IMPLIES
-Use what_conflicts_imply from mediation. Be direct. 2-3 paragraphs.
+Use what_conflicts_imply from mediation. Include the type distribution explicitly:
+"X of Y conflicts are structural/normative/etc."
 
 WHAT EACH PERSON LIKELY EXPERIENCED
-What did each person feel was happening? What did they assume the other was doing?
-Write with empathy for both — not blame, not excuse. One paragraph per person.
+One paragraph per person. Empathy without blame.
 
-HOW TO MOVE FORWARD
-Grounded only in updated_assumptions and new_objective from mediation.
-If the conflict is structural and cannot be solved by direct conversation alone,
-say that. Do not offer "have an honest conversation" as a solution to a problem
-that is exactly about what counts as honest communication. 2-3 paragraphs.
+{forward_section}
 """
 
 
@@ -985,28 +1069,35 @@ def constrained_generation_user(
     distilled_wholeness_json: str,
     final_mediation_json: str,
     all_findings_json: str,
+    conflict_type_summary_json: str,
+    salient_conflicts_json: str,
     evaluation_feedback: str | None = None,
 ) -> str:
     feedback_block = ""
     if evaluation_feedback:
-        feedback_block = f"""\
-EVALUATION FEEDBACK TO ADDRESS (from the judge on your previous draft):
-{evaluation_feedback}
-Revise the document to fix exactly these issues. Do not introduce new claims.
-
-"""
+        feedback_block = (
+            f"EVALUATION FEEDBACK TO ADDRESS:\n{evaluation_feedback}\n"
+            f"Revise to fix exactly these issues. Do not introduce new claims.\n\n"
+        )
     return f"""\
 Write the final conflict analysis document.
-Use only what mediation found. Do not introduce new claims.
+Use only what mediation found.
 
-{feedback_block}THE OCCURRING:
-{occurring_json}
+{feedback_block}\
+CONFLICT TYPE DISTRIBUTION:
+{conflict_type_summary_json}
 
-IMPLICATIONS GATHERED ACROSS THE ENTIRE MEDIATION CYCLE:
+HIGH-SEVERITY CONFLICTS (severity >= 3):
+{salient_conflicts_json}
+
+ALL IMPLICATIONS ACROSS MEDIATION CYCLES:
 {all_findings_json}
 
-DISTILLED WHOLENESS NODES FROM ALL CYCLES:
+DISTILLED WHOLENESS NODES:
 {distilled_wholeness_json}
+
+THE OCCURRING:
+{occurring_json}
 
 FINAL MEDIATION OUTPUT (most weight):
 {final_mediation_json}
@@ -1014,26 +1105,33 @@ FINAL MEDIATION OUTPUT (most weight):
 Write the five-section document now.
 """
 
-
 # ---------------------------------------------------------------------------
 # Judge prompts (LLM-as-a-judge, runs after generation)
 # ---------------------------------------------------------------------------
 
 def judge_system() -> str:
     return """\
-You are an impartial evaluator of cultural conflict analysis outputs.
-You receive a mediation output and final analysis document.
-You score four dimensions on a 1-5 scale.
+You are an adversarial evaluator of cultural conflict analyses.
+Score FIVE dimensions 1-5. Reason step by step before scoring.
 
-1 = Very poor  2 = Poor  3 = Adequate  4 = Good  5 = Excellent
+1=very poor  2=poor  3=adequate  4=good  5=excellent
 
-DIMENSIONS:
-- empathy (1-5): Does the output accurately reflect what BOTH parties experienced?
-- consensus (1-5): How much did the two cultural frames converge?
-- escalation_risk (1-5): How likely is the conflict to worsen without intervention?
-- cultural_insight (1-5): Did the analysis surface assumptions neither party would see?
+empathy (1-5): Does the output accurately reconstruct what BOTH parties experienced?
 
-Reason step by step before scoring. Write reasoning first, then scores.
+consensus (1-5): How much did the two cultural frames genuinely converge?
+
+escalation_risk (1-5): How likely is the conflict to worsen without intervention?
+
+cultural_insight (1-5): Did the analysis surface assumptions neither party would see?
+
+intervention_fidelity (1-5): Does HOW TO MOVE FORWARD prescribe the CORRECT
+intervention class for each conflict type found in mediation?
+  Score 1 — recommends dialogue/honest conversation as primary remedy for a scenario
+    where structural or normative conflicts are >= 30% of total. FALSE RESOLUTION TRAP.
+  Score 3 — avoids false resolutions but gives generic multi-step advice not
+    differentiated by conflict type.
+  Score 5 — separate paragraph per type, correct remedy per type, names who holds
+    authority for structural changes, names unresolvable conflicts as unresolvable.
 
 Respond ONLY with valid JSON. No preamble. No markdown fences.
 """
@@ -1055,7 +1153,8 @@ Return:
   "empathy": <1-5>,
   "consensus": <1-5>,
   "escalation_risk": <1-5>,
-  "cultural_insight": <1-5>
+  "cultural_insight": <1-5>,
+  "intervention_fidelity": <1-5>
 }}
 """
 
@@ -1064,7 +1163,7 @@ def judge_cycle_user(mediation_json: str, cycle: int) -> str:
     """In-loop evaluation: no final output exists yet, score the mediation only."""
     return f"""\
 Evaluate the mediation findings for cycle {cycle}. There is no final document yet,
-so judge the quality of the mediation reasoning itself on the same four dimensions.
+so judge the quality of the mediation reasoning itself on the same five dimensions.
 
 MEDIATION FINDINGS:
 {mediation_json}
@@ -1075,6 +1174,7 @@ Return:
   "empathy": <1-5>,
   "consensus": <1-5>,
   "escalation_risk": <1-5>,
-  "cultural_insight": <1-5>
+  "cultural_insight": <1-5>,
+  "intervention_fidelity": <1-5>
 }}
 """
