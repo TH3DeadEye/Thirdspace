@@ -1,6 +1,6 @@
 from pydantic import BaseModel, computed_field
 from typing import Literal
-
+from pydantic import Field
 # --- Constants (never use raw integers in logic) ---
 NUM_FACETS = 6
 NUM_DIMENSIONS = 7
@@ -136,11 +136,11 @@ class ImplyingNodes(BaseModel):
 
 class JudgeScore(BaseModel):
     cycle: int
-    empathy: int           # 1-5
-    consensus: int         # 1-5
-    escalation_risk: int   # 1-5
-    cultural_insight: int  # 1-5
-    reasoning: str
+    empathy: int = Field(ge=1, le=5)          # 1-5
+    consensus: int = Field(ge=1, le=5)       # 1-5
+    escalation_risk: int = Field(ge=1, le=5)  # 1-5
+    cultural_insight: int = Field(ge=1, le=5) # 1-5
+    reasoning: str 
 
 
 # --- Session Memory ---

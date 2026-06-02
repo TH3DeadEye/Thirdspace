@@ -7,3 +7,8 @@ __pycache__/
 .env
 outputs/
 .DS_Store
+CLAUDE.md
+SYSTEM_OVERVIEW.md
+venv/
+
+.pytest_cache/
