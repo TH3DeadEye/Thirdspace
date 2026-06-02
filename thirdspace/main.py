@@ -1,6 +1,9 @@
 import logging
 import uuid
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from models import SessionMemory, TheOccurring
 from graph import build_graph
@@ -55,7 +58,22 @@ def run_scenario(
     # / failure telemetry and trip BudgetExceeded / CircuitOpen.
     token = set_active_memory(memory)
     try:
-        result = graph.invoke({"memory": memory})
+        # run_name / metadata / tags surface on the root LangSmith trace so a
+        # run is identifiable by scenario without opening it. No-op if tracing
+        # is disabled.
+        result = graph.invoke(
+            {"memory": memory},
+            config={
+                "run_name": f"thirdspace[{scenario_id}]",
+                "metadata": {
+                    "scenario_id": scenario_id,
+                    "main_cultural_frame": main_cultural_frame,
+                    "challenger_cultural_frame": challenger_cultural_frame,
+                    "max_cycles": max_cycles,
+                },
+                "tags": ["thirdspace", "pipeline"],
+            },
+        )
     finally:
         reset_active_memory(token)
     final = result["memory"]
@@ -79,7 +97,7 @@ if __name__ == "__main__":
         raw_scenario=scenario,
         main_cultural_frame="Canadian low-context direct communication culture",
         challenger_cultural_frame="Iranian high-context honor-based communication culture",
-        max_cycles=2,
+        max_cycles=3,
     )
 
     print("\n" + "=" * 60)

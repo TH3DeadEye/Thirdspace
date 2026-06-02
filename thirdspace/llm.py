@@ -9,6 +9,8 @@ from functools import lru_cache
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 
 from models import NUM_FACETS
 from budget import (
@@ -60,12 +62,51 @@ def get_client():
 # Base callers
 # ---------------------------------------------------------------------------
 
+def _annotate_llm_run(
+    model: str,
+    usage: dict,
+    temperature: float,
+    max_tokens: int,
+    latency_ms: int,
+) -> None:
+    """Attach model identity and token usage to the active LangSmith run.
+
+    No-op when tracing is disabled (get_current_run_tree() returns None), so
+    call_llm can call it unconditionally. ls_model_name / ls_provider let
+    LangSmith map Bedrock token counts onto its cost table; usage_metadata
+    turns the run into a first-class LLM call with input/output token counts.
+    Telemetry must never break a real call, so failures are swallowed.
+    """
+    run = get_current_run_tree()
+    if run is None:
+        return
+    try:
+        run.set(
+            metadata={
+                "ls_provider": "amazon_bedrock",
+                "ls_model_name": model,
+                "ls_temperature": temperature,
+                "ls_max_tokens": max_tokens,
+                "latency_ms": latency_ms,
+            },
+            usage_metadata={
+                "input_tokens": usage.get("inputTokens", 0),
+                "output_tokens": usage.get("outputTokens", 0),
+                "total_tokens": usage.get("totalTokens", 0),
+            },
+        )
+    except Exception:
+        logger.debug("LangSmith usage annotation failed", exc_info=True)
+
+
+@traceable(name="bedrock_call", run_type="llm")
 def call_llm(
     system: str,
     user: str,
     model: str = BEDROCK_MODEL_ID,
     max_tokens: int = 8000,
     retries: int = 3,
+    temperature:float = 0.3,
 ) -> str:
     # Budget guard: refuse to issue the call if the scenario is out of budget.
     check_budget_before_call()
@@ -75,15 +116,34 @@ def call_llm(
         "modelId": model,
         "system": [{"text": system}],
         "messages": [{"role": "user", "content": [{"text": user}]}],
-        "inferenceConfig": {"maxTokens": max_tokens, "temperature": 0.3},
+        "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
     }
     for attempt in range(retries):
         t0 = time.monotonic()
         try:
             response = client.converse(**request)
             latency_ms = int((time.monotonic() - t0) * 1000)
+            text = response["output"]["message"]["content"][0]["text"]
+            if not text.strip():
+                logger.warning(
+                    f"Model returned empty response on attempt {attempt+1}/{retries}. "
+                    f"Retrying."
+                )
+                time.sleep(2 ** attempt)
+                continue
+            if response.get("stopReason") == "max_tokens":
+                # Truncated mid-output: the JSON is almost certainly incomplete
+                # and will fail to parse downstream. Surface it here so the
+                # cause is obvious rather than a cryptic JSON error.
+                logger.warning(
+                    f"Response hit maxTokens={max_tokens} and was truncated; "
+                    f"downstream JSON parsing may fail. Raise max_tokens if this recurs."
+                )
             record_success(latency_ms)
-            return response["output"]["message"]["content"][0]["text"]
+            _annotate_llm_run(
+                model, response.get("usage", {}), temperature, max_tokens, latency_ms
+            )
+            return text
         except ClientError as e:
             code = e.response["Error"]["Code"]
             if code in ("ThrottlingException", "TooManyRequestsException"):
@@ -100,6 +160,12 @@ def call_llm(
                     f"Bedrock access denied for model {model}. "
                     f"Check IAM role has bedrock:InvokeModel and the model is enabled."
                 ) from e
+            elif code == "ResourceNotFoundException":
+                record_failure()
+                raise PermissionError(
+                    f"Model '{model}' not enabled in your AWS account. "
+                    f"Go to AWS Console → Bedrock → Model access → enable Anthropic Claude."
+                ) from e
             else:
                 logger.error(f"Bedrock error on attempt {attempt+1}: {e}")
                 if attempt == retries - 1:
@@ -107,7 +173,10 @@ def call_llm(
                     raise
                 time.sleep(2 ** attempt)
     record_failure()
-    raise RuntimeError("Bedrock call failed after all retries")
+    raise RuntimeError(
+        f"Bedrock call failed after {retries} retries "
+        f"(model={model}). Last response was empty or all attempts errored."
+    )
 
 
 def _bracket_balanced_slice(text: str) -> str | None:
@@ -189,7 +258,9 @@ def _extract_json(raw: str) -> str:
     candidates = _candidate_blocks(raw)
     for block in candidates:
         try:
-            json.loads(block)
+            # strict=False so a block is accepted even when it contains the
+            # literal newlines/tabs Claude often emits inside string values.
+            json.loads(block, strict=False)
             return block
         except json.JSONDecodeError:
             continue
@@ -201,28 +272,31 @@ def _extract_json(raw: str) -> str:
 def call_llm_json(system: str, user: str, **kwargs) -> Any:
     raw = call_llm(system, user, **kwargs)
 
-    # First, try the extractor's best candidate.
-    cleaned = _extract_json(raw)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # Fallback: try every candidate (some Bedrock responses include extra
-    # commentary after a fenced block; the extractor already prefers parseable
-    # blocks but we retry explicitly for diagnostics).
+    # _candidate_blocks yields the most-promising substrings first (fenced
+    # blocks, then a bracket-balanced slice, then the raw text). strict=False
+    # tolerates the literal newlines/tabs Claude routinely emits inside string
+    # values — e.g. multi-line numbered lists in a cell's "content". Strict
+    # JSON rejects those as control characters, which was the cause of spurious
+    # "not valid JSON" failures.
+    first_error: json.JSONDecodeError | None = None
     for block in _candidate_blocks(raw):
         try:
-            return json.loads(block)
-        except json.JSONDecodeError:
+            return json.loads(block, strict=False)
+        except json.JSONDecodeError as e:
+            if first_error is None:
+                # Keep the first (best) candidate's error for diagnostics,
+                # rather than the trailing raw-text "Expecting value" artifact.
+                first_error = e
             continue
 
-    # Last resort: direct json.loads on the trimmed text.
-    try:
-        return json.loads(raw.strip())
-    except json.JSONDecodeError as e:
-        logger.error(f"Model returned non-JSON:\n{raw[:500]}")
-        raise ValueError(f"Model response was not valid JSON: {e}") from e
+    logger.error(
+        "Model response was not valid JSON (length=%d chars). If the snippet "
+        "below looks cut off, the call likely hit maxTokens and was truncated.\n%s",
+        len(raw), raw[:1500],
+    )
+    raise ValueError(
+        f"Model response was not valid JSON: {first_error}"
+    ) from first_error
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +361,7 @@ def _count_sentences(content: str) -> int:
     return max(len(parts), 1)
 
 
+@traceable(run_type="chain", name="cell_refinement")
 def call_llm_json_with_refinement(
     system: str,
     user: str,
@@ -404,6 +479,7 @@ def compress_historical_context(all_past_cycles: list[dict]) -> list[dict]:
             "converged": older.get("converged"),
             "conflict_facets": [c.get("facet") for c in older.get("conflicts", [])],
             "updated_assumptions": older.get("updated_assumptions", []),
+            "what_conflicts_imply": older.get("what_conflicts_imply", [])
         })
 
     # Most recent cycle: keep in full
@@ -667,7 +743,6 @@ Return:
 def challenger_cell_user(
     occurring_json: str,
     main_cell_content: str,
-    main_cell_response_type: str | None,
     facet: str,
     dimension: str,
 ) -> str:

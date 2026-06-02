@@ -3,6 +3,9 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
+
 from models import (
     TheOccurring, OccurringNode,
     NodeReasoningGrid, NodeDimensionCell, ReflectionFlag,
@@ -33,6 +36,50 @@ def _cell_pairs() -> list[tuple[str, str]]:
     return [(f, d) for f in FACET_LIST for d in DIMENSION_LIST]
 
 logger = logging.getLogger(__name__)
+
+
+def _cell_trace_extra(parent, agent: str, facet: str, dimension: str, cycle: int) -> dict:
+    """LangSmith run config for one cell call.
+
+    ThreadPoolExecutor workers start with a fresh contextvars context, so the
+    @traceable cell run cannot discover its parent automatically. We capture
+    the phase run in the main thread and pass it through explicitly as `parent`
+    (no-op when tracing is off and parent is None). The name + metadata make
+    each of the NUM_CELLS calls individually identifiable and filterable in the
+    LangSmith UI.
+    """
+    return {
+        "name": f"{agent}_cell[{facet}/{dimension}]",
+        "parent": parent,
+        "metadata": {
+            "facet": facet,
+            "dimension": dimension,
+            "cycle": cycle,
+            "agent": agent,
+        },
+        "tags": ["cell", agent],
+    }
+
+
+def _parse_flags(raw_flags: list) -> list[ReflectionFlag]:
+    """Normalize reflection_flags from the model.
+
+    Models sometimes return a list of dicts {"measure":..., "issue":...},
+    sometimes a list of plain strings ("clarity"), sometimes a single string.
+    This handles all three so neither agent crashes on malformed output.
+    """
+    flags: list[ReflectionFlag] = []
+    if isinstance(raw_flags, str):
+        raw_flags = [raw_flags]
+    for f in raw_flags:
+        if isinstance(f, dict):
+            flags.append(ReflectionFlag(
+                measure=f.get("measure", "unknown"),
+                issue=f.get("issue", "unspecified"),
+            ))
+        elif isinstance(f, str) and f.strip():
+            flags.append(ReflectionFlag(measure=f.strip(), issue="flagged by model"))
+    return flags
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +116,7 @@ def _sort_by_facet(nodes: list[OccurringNode]) -> list[OccurringNode]:
     return sorted(nodes, key=lambda n: FACET_LIST.index(n.facet))
 
 
+@traceable(run_type="chain", name="reformulation")
 def run_reformulation(raw_scenario: str, scenario_id: str) -> TheOccurring:
     result = call_llm_json(
         system=REFORMULATION_SYSTEM,
@@ -111,6 +159,7 @@ def run_reformulation(raw_scenario: str, scenario_id: str) -> TheOccurring:
 # One LLM call per (facet, dimension) pair. Never batched.
 # ---------------------------------------------------------------------------
 
+@traceable(run_type="chain")
 def _ct_cell(
     memory,  # SessionMemory | None — captured in the parent thread, re-registered here
     occurring_json: str,
@@ -128,10 +177,7 @@ def _ct_cell(
             system=critical_thinking_cell_system(cultural_frame, facet, dimension),
             user=critical_thinking_cell_user(occurring_json, facet, dimension),
         )
-    flags = [
-        ReflectionFlag(measure=f["measure"], issue=f["issue"])
-        for f in result.get("reflection_flags", [])
-    ]
+    flags = _parse_flags(result.get("reflection_flags", []))
     meta = result.get("_refinement_meta", {})
     return NodeDimensionCell(
         facet=facet,
@@ -145,6 +191,7 @@ def _ct_cell(
     )
 
 
+@traceable(run_type="chain", name="critical_thinking")
 def run_critical_thinking(
     occurring: TheOccurring,
     cultural_frame: str,
@@ -155,9 +202,17 @@ def run_critical_thinking(
     # Capture the active memory in the main thread; each worker re-registers
     # it on its own thread (see threading note in budget.py).
     memory = get_active_memory()
+    # Capture this phase's LangSmith run so the threaded cell runs can attach to
+    # it explicitly (contextvars don't cross the ThreadPoolExecutor boundary).
+    run = get_current_run_tree()
+    if run is not None:
+        run.add_metadata({"cycle": cycle, "agent": "main", "frame": cultural_frame})
     with ThreadPoolExecutor(max_workers=_CELL_WORKERS) as ex:
         cells = list(ex.map(
-            lambda fd: _ct_cell(memory, occurring_json, cultural_frame, fd[0], fd[1], cycle),
+            lambda fd: _ct_cell(
+                memory, occurring_json, cultural_frame, fd[0], fd[1], cycle,
+                langsmith_extra=_cell_trace_extra(run, "main", fd[0], fd[1], cycle),
+            ),
             pairs,
         ))
     if len(cells) != NUM_CELLS:
@@ -171,6 +226,7 @@ def run_critical_thinking(
 # One LLM call per cell with response_type classification.
 # ---------------------------------------------------------------------------
 
+@traceable(run_type="chain")
 def _challenger_cell(
     memory,  # SessionMemory | None — captured in the parent thread
     occurring_json: str,
@@ -192,16 +248,12 @@ def _challenger_cell(
             user=challenger_cell_user(
                 occurring_json=occurring_json,
                 main_cell_content=main_cell_content,
-                main_cell_response_type=None,
                 facet=facet,
                 dimension=dimension,
             ),
             model=CHALLENGER_MODEL_ID,
         )
-    flags = [
-        ReflectionFlag(measure=f["measure"], issue=f["issue"])
-        for f in result.get("reflection_flags", [])
-    ]
+    flags = _parse_flags(result.get("reflection_flags", []))
     meta = result.get("_refinement_meta", {})
     return NodeDimensionCell(
         facet=facet,
@@ -215,6 +267,7 @@ def _challenger_cell(
     )
 
 
+@traceable(run_type="chain", name="challenger")
 def run_challenger(
     occurring: TheOccurring,
     main_grid: NodeReasoningGrid,
@@ -240,6 +293,12 @@ def run_challenger(
 
     pairs = _cell_pairs()
     memory = get_active_memory()
+    run = get_current_run_tree()
+    if run is not None:
+        run.add_metadata({
+            "cycle": cycle, "agent": "challenger",
+            "challenger_frame": challenger_frame, "main_frame": main_frame,
+        })
     with ThreadPoolExecutor(max_workers=_CELL_WORKERS) as ex:
         cells = list(ex.map(
             lambda fd: _challenger_cell(
@@ -247,6 +306,7 @@ def run_challenger(
                 occurring_json, main_matrix,
                 challenger_frame, main_frame, challenger_style,
                 fd[0], fd[1], cycle,
+                langsmith_extra=_cell_trace_extra(run, "challenger", fd[0], fd[1], cycle),
             ),
             pairs,
         ))
@@ -261,6 +321,7 @@ def run_challenger(
 # Passes a compact cell-pair comparison and compressed history.
 # ---------------------------------------------------------------------------
 
+@traceable(run_type="chain", name="mediation")
 def run_mediation(
     occurring: TheOccurring,
     main_grid: NodeReasoningGrid,
@@ -297,6 +358,7 @@ def run_mediation(
             compressed_history_json=compressed_history_json,
             cycle=cycle,
         ),
+        max_tokens=16000,
     )
 
     conflicts = [
@@ -337,6 +399,7 @@ def run_mediation(
 # Turns the loop from a no-op into a real refinement cycle.
 # ---------------------------------------------------------------------------
 
+@traceable(run_type="chain", name="node_update")
 def run_node_update(
     occurring: TheOccurring,
     mediation: ImplyingNodes,
@@ -405,6 +468,7 @@ def _wholeness_has_signal(wholeness: WholenessImplyingNodes) -> bool:
 # Receives ONLY distilled wholeness nodes. Not the full grids.
 # ---------------------------------------------------------------------------
 
+@traceable(run_type="chain", name="constrained_generation")
 def run_constrained_generation(
     occurring: TheOccurring,
     mediation_history: list[ImplyingNodes],
@@ -430,6 +494,7 @@ def run_constrained_generation(
             all_findings_json=all_findings_json,
             evaluation_feedback=evaluation_feedback,
         ),
+        temperature=0.0
     )
 
 
@@ -437,6 +502,7 @@ def run_constrained_generation(
 # Judge (runs after generation, scores output quality)
 # ---------------------------------------------------------------------------
 
+@traceable(run_type="chain", name="judge")
 def run_judge(
     final_output: str,
     mediation_history: list[ImplyingNodes],
@@ -449,6 +515,7 @@ def run_judge(
     result = call_llm_json(
         system=judge_system(),
         user=judge_user(final_output, mediation_json),
+        temperature=0.0
     )
     return JudgeScore(
         cycle=cycle,
@@ -460,6 +527,7 @@ def run_judge(
     )
 
 
+@traceable(run_type="chain", name="cycle_judge")
 def run_cycle_judge(
     mediation: ImplyingNodes,
     cycle: int,
@@ -471,6 +539,7 @@ def run_cycle_judge(
             mediation_json=mediation.model_dump_json(),
             cycle=cycle,
         ),
+        temperature=0.0
     )
     return JudgeScore(
         cycle=cycle,
