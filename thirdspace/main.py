@@ -1,5 +1,6 @@
+import hashlib
 import logging
-import uuid
+import os
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -24,8 +25,19 @@ def persist_session(memory: SessionMemory, output_dir: Path = DEFAULT_OUTPUT_DIR
     to outputs/{scenario_id}.json. Returns the path written."""
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"{memory.scenario_id}.json"
-    path.write_text(memory.model_dump_json(indent=2))
+    # Atomic write: write a temp file in the same dir, then os.replace (atomic
+    # on POSIX). A crash mid-write leaves the old file intact, never a partial.
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(memory.model_dump_json(indent=2))
+    os.replace(tmp, path)
     return path
+
+
+def _make_scenario_id(raw_scenario: str, main_frame: str, challenger_frame: str) -> str:
+    """Deterministic 12-char id from the inputs, so re-running the same scenario
+    writes to the same output file (reproducible; no orphaned partial runs)."""
+    content = f"{raw_scenario}|{main_frame}|{challenger_frame}"
+    return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 
 def run_scenario(
@@ -36,7 +48,9 @@ def run_scenario(
     challenger_style: str | None = None,
     output_dir: Path | None = DEFAULT_OUTPUT_DIR,
 ) -> SessionMemory:
-    scenario_id = str(uuid.uuid4())[:8]
+    scenario_id = _make_scenario_id(
+        raw_scenario, main_cultural_frame, challenger_cultural_frame
+    )
     fields = {
         "scenario_id": scenario_id,
         "main_cultural_frame": main_cultural_frame,

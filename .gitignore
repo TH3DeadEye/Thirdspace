@@ -12,3 +12,6 @@ SYSTEM_OVERVIEW.md
 venv/
 
 .pytest_cache/
+thirdspace classes part1.txt
+thirdspace/aws/
+docs/

@@ -19,21 +19,23 @@ from models import (
 )
 from llm import (
     call_llm, call_llm_json, call_llm_json_with_refinement,
-    compress_historical_context, linearize_grid_to_matrix_map,
-    CHALLENGER_MODEL_ID,
+    CHALLENGER_MODEL_ID, JUDGE_MODEL_ID,
+)
+from utils.context import compress_historical_context, linearize_grid_to_matrix_map
+from utils.prompts import (
     REFORMULATION_SYSTEM, reformulation_user,
     critical_thinking_cell_system, critical_thinking_cell_user,
     challenger_cell_system, challenger_cell_user,
     NODE_UPDATE_SYSTEM, node_update_user,
     MEDIATION_SYSTEM, mediation_user,
-    build_constrained_generation_system , constrained_generation_user,
+    build_constrained_generation_system, constrained_generation_user,
     judge_system, judge_user, judge_cycle_user,
 )
 from budget import active_memory, get_active_memory
 
 # Cell-level concurrency. The Bedrock boto3 client is thread-safe; cells within
 # a phase are independent so they can run in parallel. Tune via env var.
-_CELL_WORKERS = int(os.environ.get("THIRDSPACE_CELL_WORKERS", "8"))
+_CELL_WORKERS = max(1, min(int(os.environ.get("THIRDSPACE_CELL_WORKERS", "8")), NUM_CELLS))
 
 
 def _cell_pairs() -> list[tuple[str, str]]:
@@ -448,11 +450,19 @@ def run_node_update(
         facet = n["facet"]
         prev = existing.get(facet)
         changed = bool(n.get("changed", False))
+        if not changed and prev is not None:
+            # Model claims this node is unchanged: trust the original content,
+            # not its possibly-reworded copy (prevents silent drift between cycles).
+            content = prev.content
+            assumptions = list(prev.assumptions)
+        else:
+            content = n["content"]
+            assumptions = n.get("assumptions", [])
         nodes.append(OccurringNode(
             node_id=n.get("node_id", facet),
             facet=facet,
-            content=n["content"],
-            assumptions=n.get("assumptions", []),
+            content=content,
+            assumptions=assumptions,
             # Only advance the stamp on nodes the update actually touched.
             last_updated_cycle=cycle if changed else (
                 prev.last_updated_cycle if prev else 0
@@ -562,6 +572,7 @@ def run_judge(
     final_output: str,
     mediation_history: list[ImplyingNodes],
     cycle: int,
+    model: str = JUDGE_MODEL_ID,
 ) -> JudgeScore:
     mediation_json = json.dumps(
         [m.model_dump() for m in mediation_history],
@@ -570,7 +581,8 @@ def run_judge(
     result = call_llm_json(
         system=judge_system(),
         user=judge_user(final_output, mediation_json),
-        temperature=0.0
+        temperature=0.0,
+        model=model,
     )
     return JudgeScore(
         cycle=cycle,
@@ -587,6 +599,7 @@ def run_judge(
 def run_cycle_judge(
     mediation: ImplyingNodes,
     cycle: int,
+    model: str = JUDGE_MODEL_ID,
 ) -> JudgeScore:
     """In-loop evaluation of a single cycle's mediation (no final output yet)."""
     result = call_llm_json(
@@ -595,7 +608,8 @@ def run_cycle_judge(
             mediation_json=mediation.model_dump_json(),
             cycle=cycle,
         ),
-        temperature=0.0
+        temperature=0.0,
+        model=model,
     )
     return JudgeScore(
         cycle=cycle,

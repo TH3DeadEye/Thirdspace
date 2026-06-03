@@ -30,6 +30,7 @@ def call_llm(
     model: str = BEDROCK_MODEL_ID,
     max_tokens: int = 8000,
     retries: int = 3,
+    temperature:int = 0.3
 ) -> str:
     client = get_client()
     #Bedrock converse API expects a specific request format
@@ -41,7 +42,7 @@ def call_llm(
         ],
         "inferenceConfig": {
             "maxTokens": max_tokens,
-            "temperature": 0.3,   # lower = more consistent structured output
+            "temperature": temperature,   # lower = more consistent structured output
         },
     }
     #rate limiting and error handeling

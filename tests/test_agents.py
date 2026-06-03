@@ -135,7 +135,11 @@ class TestMediation(unittest.TestCase):
                 "response_type": "challenge",
                 "main_content": "main says",
                 "challenger_content": "challenger says",
-                "implication": "This reveals that ...",
+                "implication": "This reveals that both parties operated under incompatible definitions of professional respect.",
+                "conflict_type": "normative",
+                "conflict_type_rationale": "Classified normative because both understand each other yet neither will change position.",
+                "severity": 4,
+                "resolvability": "facilitated",
             }],
             "what_conflicts_imply": ["pattern"],
             "updated_assumptions": ["individuals node: remove [X] -> replace with [Y]"],
@@ -158,7 +162,8 @@ class TestMediation(unittest.TestCase):
         )
         self.assertEqual(med.cycle, 0)
         self.assertEqual(len(med.conflicts), 1)
-        self.assertEqual(med.conflicts[0].implication, "This reveals that ...")
+        self.assertEqual(med.conflicts[0].conflict_type, "normative")
+        self.assertEqual(med.conflicts[0].resolvability, "facilitated")
         self.assertEqual(med.wholeness.reformulated_query, "sharper")
 
 
@@ -268,7 +273,7 @@ class TestJudges(unittest.TestCase):
     def test_run_judge_builds_score(self):
         agents.call_llm_json = lambda **k: {
             "reasoning": "good", "empathy": 4, "consensus": 3,
-            "escalation_risk": 2, "cultural_insight": 5,
+            "escalation_risk": 2, "cultural_insight": 5, "intervention_fidelity": 4,
         }
         score = agents.run_judge("FINAL DOC", [make_mediation(0)], cycle=0)
         self.assertIsInstance(score, JudgeScore)
@@ -278,7 +283,7 @@ class TestJudges(unittest.TestCase):
     def test_run_cycle_judge_builds_score(self):
         agents.call_llm_json = lambda **k: {
             "reasoning": "ok", "empathy": 3, "consensus": 3,
-            "escalation_risk": 3, "cultural_insight": 3,
+            "escalation_risk": 3, "cultural_insight": 3, "intervention_fidelity": 3,
         }
         score = agents.run_cycle_judge(make_mediation(7), cycle=7)
         self.assertEqual(score.cycle, 7)

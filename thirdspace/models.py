@@ -286,7 +286,7 @@ class JudgeScore(BaseModel):
     consensus: int = Field(ge=1, le=5)
     escalation_risk: int = Field(ge=1, le=5)
     cultural_insight: int = Field(ge=1, le=5)
-    intervention_fidelity: int = Field(ge=1, le=5)   
+    intervention_fidelity: int = Field(ge=1, le=5)  
     reasoning: str
 
 # --- Session Memory ---
@@ -317,14 +317,22 @@ class SessionMemory(BaseModel):
     output_judge_scores: list[JudgeScore] = []
     current_cycle: int = 0
     max_cycles: int = 3
+    
     # Generation <-> evaluation regeneration loop controls.
     max_regen: int = 1
     regen_attempts: int = 0
     output_score_threshold: int = 3
+
     # Consensus plateau as a secondary convergence signal. If the last two
     # cycle judges both score consensus >= threshold and differ by <= 1, the
     # loop terminates even if the mediator did not self-declare converged.
     consensus_plateau_threshold: int = 4
+    
+        # Structural convergence guard. If the mediator self-declares converged but
+    # the conflict-cell Jaccard vs the previous cycle is below this, treat it as
+    # premature (new conflicts still appearing) and keep looping.
+    jaccard_convergence_threshold: float = 0.7
+
     # Cost / latency guardrails. call_llm increments llm_calls_made and
     # total_latency_ms on every Bedrock call. BudgetExceeded raises when
     # llm_calls_made would exceed llm_call_budget. The circuit breaker counts
