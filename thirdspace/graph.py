@@ -3,6 +3,8 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, END
 
+from metrics import conflict_jaccard
+
 from models import SessionMemory
 from agents import (
     run_reformulation,
@@ -168,16 +170,28 @@ def should_loop(state: GraphState) -> str:
     looping; terminating cycles skip it to save budget. The judge then feeds
     the plateau check via `should_continue_after_judge`.
     """
+
     mem = state["memory"]
+    history = mem.mediation_history
+
+    if mem.current_cycle >= mem.max_cycles:
+        logger.info(f"{mem.scenario_id} Max cycles reached")
+        return "generate"
+
     if mem.converged:
+        if len(history) >= 2:
+            j = conflict_jaccard(history[-2], history[-1])
+            if j < mem.jaccard_convergence_threshold:
+                logger.info(
+                    f"[{mem.scenario_id}] LLM converged but Jaccard={j:.2f} < "
+                    f"{mem.jaccard_convergence_threshold}; new conflicts, continuing"
+                )
+                return "evaluate_cycle"
         logger.info(f"[{mem.scenario_id}] Converged at cycle {mem.current_cycle}")
         return "generate"
-    if mem.current_cycle >= mem.max_cycles:
-        logger.info(f"[{mem.scenario_id}] Max cycles reached")
-        return "generate"
+
     logger.info(f"[{mem.scenario_id}] Not converged, evaluating cycle {mem.current_cycle}")
     return "evaluate_cycle"
-
 
 def should_continue_after_judge(state: GraphState) -> str:
     """After scoring the cycle, check the secondary plateau signal.

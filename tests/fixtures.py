@@ -63,4 +63,5 @@ def make_mediation(cycle: int, converged: bool = False) -> ImplyingNodes:
 
 def make_judge_score(cycle: int) -> JudgeScore:
     return JudgeScore(cycle=cycle, empathy=4, consensus=4, escalation_risk=2,
-                      cultural_insight=4, reasoning="stub reasoning")
+                      cultural_insight=4, intervention_fidelity=4,
+                      reasoning="stub reasoning")

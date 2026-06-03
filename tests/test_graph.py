@@ -30,13 +30,14 @@ def _install_stubs(g_module, *, low_score: bool = False, max_loop_cycles: int = 
     g_module.run_node_update = lambda occurring, mediation: make_occurring("updated")
     g_module.run_cycle_judge = lambda mediation, cycle: JudgeScore(
         cycle=cycle, empathy=5, consensus=5, escalation_risk=2,
-        cultural_insight=5, reasoning="cycle ok",
+        cultural_insight=5, intervention_fidelity=5, reasoning="cycle ok",
     )
     output_empathy = 1 if low_score else 5
     output_insight = 1 if low_score else 5
     g_module.run_judge = lambda final_output, mediation_history, cycle: JudgeScore(
         cycle=cycle, empathy=output_empathy, consensus=3, escalation_risk=3,
-        cultural_insight=output_insight, reasoning="output judge reasoning",
+        cultural_insight=output_insight, intervention_fidelity=5,
+        reasoning="output judge reasoning",
     )
     g_module.run_constrained_generation = (
         lambda occurring, mediation_history, evaluation_feedback=None:
@@ -158,11 +159,11 @@ class TestConsensusPlateau(unittest.TestCase):
         # Cycle judge: always returns consensus=5 so two in a row trigger plateau.
         g_module.run_cycle_judge = lambda mediation, cycle: JudgeScore(
             cycle=cycle, empathy=5, consensus=5, escalation_risk=2,
-            cultural_insight=5, reasoning="cycle ok",
+            cultural_insight=5, intervention_fidelity=5, reasoning="cycle ok",
         )
         g_module.run_judge = lambda final_output, mediation_history, cycle: JudgeScore(
             cycle=cycle, empathy=5, consensus=5, escalation_risk=2,
-            cultural_insight=5, reasoning="output judge reasoning",
+            cultural_insight=5, intervention_fidelity=5, reasoning="output judge reasoning",
         )
         g_module.run_constrained_generation = (
             lambda occurring, mediation_history, evaluation_feedback=None: "DOC"
