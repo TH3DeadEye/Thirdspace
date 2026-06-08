@@ -1,6 +1,11 @@
 """All system prompts and user-prompt builders for every pipeline phase."""
 from models import NUM_FACETS, INTERVENTION_CLASS
+from utils.decorators import decorate, load_decorator
 
+#loading decorators
+FIRST_PRINCIPLES = load_decorator("first-principles")
+RED_TEAM         = load_decorator("red-team")
+BLIND_SPOTS      = load_decorator("blind-spots", depth="comprehensive", categories=["cultural"])
 
 # ---------------------------------------------------------------------------
 # Phase 1 — Reformulation prompts
@@ -122,50 +127,45 @@ Return this exact JSON. All 6 nodes required:
 # ---------------------------------------------------------------------------
 
 def critical_thinking_cell_system(cultural_frame: str, facet: str, dimension: str) -> str:
-    """
-    System prompt for a single cell: one facet × one dimension.
-    This is intentionally narrow. The CT agent makes NUM_CELLS separate calls,
-    one per (facet, dimension) pair. Never batch dimensions.
-    """
-    return f"""\
-You are the primary reasoning agent in a cultural conflict analysis system.
+  base = f"""\
+  You are the primary reasoning agent in a cultural conflict analysis system.
 
-YOUR CULTURAL FRAME: {cultural_frame}
-This is not a flaw — it is your function. Whenever your frame shapes your
-reasoning, name it. Do not let {cultural_frame} assumptions appear as
-neutral observations.
+  YOUR CULTURAL FRAME: {cultural_frame}
+  This is not a flaw — it is your function. Whenever your frame shapes your
+  reasoning, name it. Do not let {cultural_frame} assumptions appear as
+  neutral observations.
 
-YOUR TASK: Reason about ONE specific node × dimension cell.
-NODE (facet): {facet}
-DIMENSION: {dimension}
+  YOUR TASK: Reason about ONE specific node × dimension cell.
+  NODE (facet): {facet}
+  DIMENSION: {dimension}
 
-DIMENSION DEFINITIONS:
-- objective: What is the actual goal of reasoning about this node? Is it feasible?
-- query_formulation: Is the question framed correctly? Can it be broken into sub-questions?
-- perspective: What viewpoint is guiding you? Where does it break down?
-- assumptions: What are you taking for granted? Which assumptions are load-bearing?
-- evidence: Which facts support this? Any alternative explanations?
-- concepts: Which cultural frameworks are you applying? Have you quietly adjusted
-  any assumption to fit a preferred theory? If yes, name it.
-- implications: If your reasoning is correct, what specifically follows?
+  DIMENSION DEFINITIONS:
+  - objective: What is the actual goal of reasoning about this node? Is it feasible?
+  - query_formulation: Is the question framed correctly? Can it be broken into sub-questions?
+  - perspective: What viewpoint is guiding you? Where does it break down?
+  - assumptions: What are you taking for granted? Which assumptions are load-bearing?
+  - evidence: Which facts support this? Any alternative explanations?
+  - concepts: Which cultural frameworks are you applying? Have you quietly adjusted
+    any assumption to fit a preferred theory? If yes, name it.
+  - implications: If your reasoning is correct, what specifically follows?
 
-SELF-CHECK before writing. Record failures in reflection_flags:
-  clarity, correctness, precision, proportion, depth,
-  comprehensiveness, logic, fairness
+  SELF-CHECK before writing. Record failures in reflection_flags:
+    clarity, correctness, precision, proportion, depth,
+    comprehensiveness, logic, fairness
 
-Write 3 to 6 sentences. Be specific to THIS facet and THIS dimension only.
+  Write 3 to 6 sentences. Be specific to THIS facet and THIS dimension only.
 
-Respond ONLY with valid JSON. No preamble. No markdown fences.
-Return:
-{{
-  "content": "<your reasoning — 3 to 6 sentences>",
-  "reflection_flags": [
-    {{"measure": "<name>", "issue": "<what failed>"}}
-  ]
-}}
-reflection_flags is [] if all checks pass.
-"""
-
+  Respond ONLY with valid JSON. No preamble. No markdown fences.
+  Return:
+  {{
+    "content": "<your reasoning — 3 to 6 sentences>",
+    "reflection_flags": [
+      {{"measure": "<name>", "issue": "<what failed>"}}
+    ]
+  }}
+  reflection_flags is [] if all checks pass.
+  """
+  return decorate(base,FIRST_PRINCIPLES )
 
 def critical_thinking_cell_user(occurring_json: str, facet: str, dimension: str) -> str:
     return f"""\
@@ -192,7 +192,7 @@ def challenger_cell_system(
     facet: str,
     dimension: str,
 ) -> str:
-    return f"""\
+    base =  f"""\
 You are the Challenger agent in a cultural conflict analysis system.
 
 YOUR CULTURAL FRAME: {challenger_frame}
@@ -226,7 +226,7 @@ Return:
   "reflection_flags": []
 }}
 """
-
+    return decorate(base, RED_TEAM)
 
 def challenger_cell_user(
     occurring_json: str,
@@ -316,6 +316,8 @@ conflicts appeared.
 
 Respond ONLY with valid JSON. No preamble. No markdown fences.
 """
+
+MEDIATION_SYSTEM = decorate(MEDIATION_SYSTEM, BLIND_SPOTS)
 
 def mediation_user(
     occurring_json: str,
