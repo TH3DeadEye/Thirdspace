@@ -29,7 +29,7 @@ from utils.prompts import (
     NODE_UPDATE_SYSTEM, node_update_user,
     MEDIATION_SYSTEM, mediation_user,
     build_constrained_generation_system, constrained_generation_user,
-    judge_system, judge_user, judge_cycle_user,
+    judge_output_system, judge_cycle_system, judge_user, judge_cycle_user,
 )
 from budget import active_memory, get_active_memory
 
@@ -574,13 +574,12 @@ def run_judge(
     cycle: int,
     model: str = JUDGE_MODEL_ID,
 ) -> JudgeScore:
-    mediation_json = json.dumps(
-        [m.model_dump() for m in mediation_history],
-        ensure_ascii=False,
-    )
+    # The output judge is a BLIND reviewer: it sees only the finished document,
+    # never the mediation internals. (mediation_history stays in the signature
+    # for a future grounding checker.)
     result = call_llm_json(
-        system=judge_system(),
-        user=judge_user(final_output, mediation_json),
+        system=judge_output_system(),
+        user=judge_user(final_output),
         temperature=0.0,
         model=model,
     )
@@ -603,7 +602,7 @@ def run_cycle_judge(
 ) -> JudgeScore:
     """In-loop evaluation of a single cycle's mediation (no final output yet)."""
     result = call_llm_json(
-        system=judge_system(),
+        system=judge_cycle_system(),
         user=judge_cycle_user(
             mediation_json=mediation.model_dump_json(),
             cycle=cycle,

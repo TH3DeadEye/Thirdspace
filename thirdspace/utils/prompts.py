@@ -4,8 +4,8 @@ from utils.decorators import decorate, load_decorator
 
 #loading decorators
 FIRST_PRINCIPLES = load_decorator("first-principles")
-RED_TEAM         = load_decorator("red-team")
-BLIND_SPOTS      = load_decorator("blind-spots", depth="comprehensive", categories=["cultural"])
+RED_TEAM = load_decorator("red-team")
+BLIND_SPOTS = load_decorator("blind-spots", depth="comprehensive", categories=["cultural"])
 
 # ---------------------------------------------------------------------------
 # Phase 1 — Reformulation prompts
@@ -599,43 +599,79 @@ Write the five-section document now.
 # Judge prompts (LLM-as-a-judge, runs after generation)
 # ---------------------------------------------------------------------------
 
-def judge_system() -> str:
+def judge_output_system() -> str:
+    """Blind external reviewer. Reads ONLY the finished document — knows nothing
+    about the mediation, agents, or grids."""
     return """\
-You are an adversarial evaluator of cultural conflict analyses.
-Score FIVE dimensions 1-5. Reason step by step before scoring.
+You are a blind external reviewer reading a finished cultural conflict analysis
+for the first time. You know NOTHING about how it was produced — there were no
+internal agents, no mediation, no reasoning grid that you can see. Judge ONLY the
+document in front of you, on its own terms.
 
+Score FIVE dimensions 1-5. Reason step by step before scoring.
 1=very poor  2=poor  3=adequate  4=good  5=excellent
 
-empathy (1-5): Does the output accurately reconstruct what BOTH parties experienced?
+empathy (1-5): Does the document reconstruct what BOTH parties experienced,
+without blame or false balance?
 
-consensus (1-5): How much did the two cultural frames genuinely converge?
+consensus (1-5): Does it show clearly where the two frames genuinely meet and
+where they remain apart?
 
-escalation_risk (1-5): How likely is the conflict to worsen without intervention?
+escalation_risk (1-5): Does it convey how likely the conflict is to worsen
+without intervention, and why?
 
-cultural_insight (1-5): Did the analysis surface assumptions neither party would see?
+cultural_insight (1-5): Does it surface assumptions neither party would see from
+inside their own frame?
 
-intervention_fidelity (1-5): Does HOW TO MOVE FORWARD prescribe the CORRECT
-intervention class for each conflict type found in mediation?
-  Score 1 — recommends dialogue/honest conversation as primary remedy for a scenario
-    where structural or normative conflicts are >= 30% of total. FALSE RESOLUTION TRAP.
-  Score 3 — avoids false resolutions but gives generic multi-step advice not
-    differentiated by conflict type.
-  Score 5 — separate paragraph per type, correct remedy per type, names who holds
-    authority for structural changes, names unresolvable conflicts as unresolvable.
+intervention_fidelity (1-5): Are the document's recommendations internally
+consistent with the kinds of problem the document itself describes?
+  Score 1 — it recommends dialogue or "an honest conversation" as the main fix
+    for problems it describes as rooted in power, institutions, or incompatible values.
+  Score 3 — recommendations are generic and not matched to the described problems.
+  Score 5 — recommendations fit the described problems and the document is honest
+    about what cannot be resolved by the parties talking alone.
+
+Do NOT reference "mediation", "agents", "grid", or "cells" — you cannot see those.
+Judge the prose as a reader would.
 
 Respond ONLY with valid JSON. No preamble. No markdown fences.
 """
 
 
-def judge_user(final_output: str, mediation_json: str) -> str:
+def judge_cycle_system() -> str:
+    """In-loop reviewer of one mediation cycle (no document exists yet).
+    This one DOES see the mediation — that is its job."""
+    return """\
+You are evaluating a single mediation cycle's findings. There is no final document
+yet — score the mediation reasoning itself.
+
+Score FIVE dimensions 1-5. Reason step by step before scoring.
+1=very poor  2=poor  3=adequate  4=good  5=excellent
+
+empathy (1-5): Does the mediation reconstruct what BOTH parties experienced?
+consensus (1-5): How much did the two frames genuinely converge this cycle?
+escalation_risk (1-5): How likely is the conflict to worsen without intervention?
+cultural_insight (1-5): Did it surface assumptions neither party would see?
+
+intervention_fidelity (1-5): Do this cycle's updated_assumptions and
+what_conflicts_imply steer toward the correct remedy for the dominant conflict
+type — and AWAY from dialogue for structural/normative conflicts?
+  Score 1 — findings point to "better communication" as the fix for a structural-
+    or normative-dominant set.
+  Score 3 — findings are generic, not differentiated by conflict type.
+  Score 5 — assumptions name structural constraints for structural conflicts,
+    irreducible difference for normative, shared definitions for semantic, etc.
+
+Respond ONLY with valid JSON. No preamble. No markdown fences.
+"""
+
+
+def judge_user(final_output: str) -> str:
     return f"""\
-Evaluate this cultural conflict analysis.
+Evaluate this cultural conflict analysis document.
 
-FINAL OUTPUT:
+DOCUMENT:
 {final_output}
-
-MEDIATION FINDINGS:
-{mediation_json}
 
 Return:
 {{
