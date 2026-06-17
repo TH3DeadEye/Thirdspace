@@ -13,14 +13,22 @@ for p in (_ROOT, _ROOT / "thirdspace"):
         sys.path.insert(0, str(p))
 
 import graph as g
-from models import SessionMemory, JudgeScore
-from tests.fixtures import make_occurring, make_grid, make_mediation
+import metrics
+from models import SessionMemory, JudgeScore, ImplyingNodes
+from tests.fixtures import make_occurring, make_grid, make_mediation, make_wholeness
+
+
+def _char_embed(text):
+    """Deterministic offline embedding (per-character counts)."""
+    alphabet = "abcdefghijklmnopqrstuvwxyz "
+    low = text.lower()
+    return [float(low.count(c)) for c in alphabet]
 
 
 def _install_stubs(g_module, *, low_score: bool = False, max_loop_cycles: int = 2):
     """Replace every agent function bound in graph.py's namespace with a stub."""
     g_module.run_reformulation = lambda raw_scenario, scenario_id: make_occurring(scenario_id)
-    g_module.run_critical_thinking = lambda occurring, cultural_frame, cycle: make_grid("main", cycle)
+    g_module.run_critical_thinking = lambda occurring, cultural_frame, cycle, prior_mediation=None: make_grid("main", cycle)
     g_module.run_challenger = lambda **kw: make_grid("challenger", kw["cycle"])
     g_module.run_mediation = lambda **kw: make_mediation(
         cycle=kw["cycle"],
@@ -53,6 +61,10 @@ def _mem(max_cycles: int = 2) -> SessionMemory:
         active_challenger_perspective="B",
         occurring=make_occurring("t1"),
         max_cycles=max_cycles,
+        # These orchestration tests exercise routing, not the metric. Pin to
+        # jaccard so the convergence guard stays offline (the embedding metric
+        # has its own dedicated test with a stubbed embedder).
+        convergence_metric="jaccard",
     )
 
 
@@ -152,7 +164,7 @@ class TestConsensusPlateau(unittest.TestCase):
         """Stubs where mediation never self-declares converged. The plateau
         check is the only way the loop can terminate before max_cycles."""
         g_module.run_reformulation = lambda raw_scenario, scenario_id: make_occurring(scenario_id)
-        g_module.run_critical_thinking = lambda occurring, cultural_frame, cycle: make_grid("main", cycle)
+        g_module.run_critical_thinking = lambda occurring, cultural_frame, cycle, prior_mediation=None: make_grid("main", cycle)
         g_module.run_challenger = lambda **kw: make_grid("challenger", kw["cycle"])
         g_module.run_mediation = lambda **kw: make_mediation(cycle=kw["cycle"], converged=False)
         g_module.run_node_update = lambda occurring, mediation: make_occurring("updated")
@@ -194,6 +206,65 @@ class TestBackwardsCompatibleJudgeScores(unittest.TestCase):
         self.assertEqual(
             len(combined), len(out.cycle_judge_scores) + len(out.output_judge_scores)
         )
+
+
+class TestEmbeddingConvergence(unittest.TestCase):
+    """With convergence_metric='embedding', a premature LLM convergence whose
+    findings still differ semantically from the prior cycle must NOT terminate
+    the loop — the embedding guard keeps it going."""
+
+    def _med(self, cycle, converged, implies):
+        return ImplyingNodes(
+            cycle=cycle, agreements=[], conflicts=[],
+            what_conflicts_imply=implies, updated_assumptions=[],
+            wholeness=make_wholeness(reformulated=None), converged=converged,
+        )
+
+    def _install(self, g_module):
+        g_module.run_reformulation = lambda raw_scenario, scenario_id: make_occurring(scenario_id)
+        g_module.run_critical_thinking = lambda occurring, cultural_frame, cycle, prior_mediation=None: make_grid("main", cycle)
+        g_module.run_challenger = lambda **kw: make_grid("challenger", kw["cycle"])
+        # Highly different per-cycle findings => low embedding cosine between
+        # consecutive cycles. The mediator self-declares converged from cycle 1.
+        blocks = {0: ["aaaa aaaa aaaa"], 1: ["zzzz zzzz zzzz"], 2: ["mmmm mmmm mmmm"]}
+        g_module.run_mediation = lambda **kw: self._med(
+            kw["cycle"], kw["cycle"] >= 1, blocks[kw["cycle"]]
+        )
+        # Consensus BELOW the plateau threshold (4), so the plateau signal never
+        # fires and the embedding guard is the only loop control.
+        g_module.run_cycle_judge = lambda mediation, cycle: JudgeScore(
+            cycle=cycle, empathy=5, consensus=2, escalation_risk=2,
+            cultural_insight=5, intervention_fidelity=5, reasoning="cycle ok",
+        )
+        g_module.run_node_update = lambda occurring, mediation: make_occurring("updated")
+        g_module.run_judge = lambda final_output, mediation_history, cycle: JudgeScore(
+            cycle=cycle, empathy=5, consensus=5, escalation_risk=2,
+            cultural_insight=5, intervention_fidelity=5, reasoning="output judge",
+        )
+        g_module.run_constrained_generation = (
+            lambda occurring, mediation_history, evaluation_feedback=None: "DOC"
+        )
+
+    def test_low_embedding_similarity_overrides_premature_convergence(self):
+        orig = metrics.embed_text
+        metrics.embed_text = _char_embed
+        self._install(g)
+        try:
+            compiled = g.build_graph()
+            mem = SessionMemory(
+                scenario_id="emb", main_cultural_frame="A",
+                challenger_cultural_frame="B", active_challenger_perspective="B",
+                occurring=make_occurring("emb"), max_cycles=3,
+                convergence_metric="embedding",
+            )
+            out = compiled.invoke({"memory": mem})["memory"]
+        finally:
+            metrics.embed_text = orig
+        # The mediator declared converged at cycle 1, but cycle 0 vs 1 findings
+        # are semantically far apart, so the loop continued to max_cycles=3.
+        # (Under jaccard, empty conflict sets would have stopped it at cycle 1.)
+        self.assertEqual(len(out.mediation_history), 3)
+        self.assertEqual(out.final_output, "DOC")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,29 @@ FIRST_PRINCIPLES = load_decorator("first-principles")
 RED_TEAM = load_decorator("red-team")
 BLIND_SPOTS = load_decorator("blind-spots", depth="comprehensive", categories=["cultural"])
 
+
+def render_frame(frame) -> str:
+    """Render a CulturalFrame (str | list[CultureAxis] | None) to a prompt string.
+
+    Empty string / empty list / None => "" which the cell system prompts treat as
+    neutral (no-frame) mode. A free-text label passes through; a list of axes is
+    rendered as "dimension: value; dimension: value". Dicts are tolerated so a
+    raw deserialized frame works too.
+    """
+    if not frame:
+        return ""
+    if isinstance(frame, str):
+        return frame.strip()
+    parts: list[str] = []
+    for axis in frame:
+        if isinstance(axis, dict):
+            dim, val = axis.get("dimension", ""), axis.get("value", "")
+        else:
+            dim, val = getattr(axis, "dimension", ""), getattr(axis, "value", "")
+        if dim or val:
+            parts.append(f"{dim}: {val}")
+    return "; ".join(parts)
+
 # ---------------------------------------------------------------------------
 # Phase 1 — Reformulation prompts
 # ---------------------------------------------------------------------------
@@ -127,13 +150,26 @@ Return this exact JSON. All 6 nodes required:
 # ---------------------------------------------------------------------------
 
 def critical_thinking_cell_system(cultural_frame: str, facet: str, dimension: str) -> str:
+  # Empty cultural_frame => neutral-analyst mode: drop the frame block AND the
+  # "name your frame" instruction (the suspected verbosity driver), so a no-frame
+  # run isolates the frame as a variable.
+  if cultural_frame:
+    frame_block = (
+      f"  YOUR CULTURAL FRAME: {cultural_frame}\n"
+      "  This is not a flaw — it is your function. Whenever your frame shapes your\n"
+      f"  reasoning, name it. Do not let {cultural_frame} assumptions appear as\n"
+      "  neutral observations."
+    )
+  else:
+    frame_block = (
+      "  YOU HAVE NO ASSIGNED CULTURAL FRAME:\n"
+      "  Reason as a neutral critical-thinking analyst. Do not adopt or simulate any\n"
+      "  particular cultural stance; weigh each party's frameworks even-handedly."
+    )
   base = f"""\
   You are the primary reasoning agent in a cultural conflict analysis system.
 
-  YOUR CULTURAL FRAME: {cultural_frame}
-  This is not a flaw — it is your function. Whenever your frame shapes your
-  reasoning, name it. Do not let {cultural_frame} assumptions appear as
-  neutral observations.
+{frame_block}
 
   YOUR TASK: Reason about ONE specific node × dimension cell.
   NODE (facet): {facet}
@@ -167,18 +203,29 @@ def critical_thinking_cell_system(cultural_frame: str, facet: str, dimension: st
   """
   return decorate(base,FIRST_PRINCIPLES )
 
-def critical_thinking_cell_user(occurring_json: str, facet: str, dimension: str) -> str:
-    return f"""\
+def critical_thinking_cell_user(
+    occurring_json: str,
+    facet: str,
+    dimension: str,
+    prior_findings: str | None = None,
+) -> str:
+    base = f"""\
 Reason about this specific node and dimension.
 
 FACET: {facet}
 DIMENSION: {dimension}
 
-THE OCCURRING (full context):
+THE OCCURRING:
 {occurring_json}
 
 Focus only on the {facet} node as seen through the {dimension} lens.
 """
+    if prior_findings:
+        base += (
+            "\nPRIOR CYCLE REFINEMENTS — advance beyond previous reasoning:\n"
+            f"{prior_findings}\n"
+        )
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -192,36 +239,89 @@ def challenger_cell_system(
     facet: str,
     dimension: str,
 ) -> str:
-    base =  f"""\
+    # Empty challenger_frame => neutral mode: the challenger stays an independent
+    # second analyst that surfaces the strongest ALTERNATIVE reading, but without a
+    # designated cultural stance (and without the "name your frame" lines).
+    if challenger_frame:
+        identity_lines = [f"YOUR CULTURAL FRAME: {challenger_frame}"]
+        if main_frame:
+            identity_lines.append(f"THE CONTRASTING FRAME IN THIS SCENARIO: {main_frame}")
+        identity_block = "\n".join(identity_lines)
+        independent_voice = (
+            "You do NOT see and do NOT respond to any other agent's reasoning. Reason about\n"
+            f"this cell entirely from within {challenger_frame}, building the strongest reading\n"
+            "the cell supports from your frame alone. A separate mediation step will later\n"
+            "compare your reasoning against the other frame — that is not your job here."
+        )
+        naming_block = (
+            f"Whenever {challenger_frame} shapes your reasoning, name it. Do not let\n"
+            f"{challenger_frame} assumptions appear as neutral observations."
+        )
+        consistency = f"Stay in {challenger_frame} consistently. "
+    else:
+        identity_block = "YOU HAVE NO ASSIGNED CULTURAL FRAME:"
+        independent_voice = (
+            "You do NOT see and do NOT respond to any other agent's reasoning. Reason about\n"
+            "this cell as a neutral, independent second analyst whose job is to surface the\n"
+            "strongest ALTERNATIVE reading the cell supports — one a single dominant\n"
+            "interpretation would miss. A separate mediation step will later compare your\n"
+            "reasoning against the other analyst's — that is not your job here."
+        )
+        naming_block = (
+            "Name the interpretive assumptions you rely on. Do not let any single reading\n"
+            "appear as a neutral observation."
+        )
+        consistency = ""
+
+    if main_frame:
+        most_important_move = (
+            f"Name any place where a {main_frame}-style norm would be mistaken for a universal\n"
+            "human fact, and state how the same moment reads differently from your standpoint.\n"
+            "Do this from your own standpoint — not by reacting to another agent."
+        )
+    else:
+        most_important_move = (
+            "Name any place where one party's norm would be mistaken for a universal human\n"
+            "fact, and articulate the strongest alternative reading of the same moment.\n"
+            "Do this from your own standpoint — not by reacting to another agent."
+        )
+
+    base = f"""\
 You are the Challenger agent in a cultural conflict analysis system.
 
-YOUR CULTURAL FRAME: {challenger_frame}
-THE FRAME YOU ARE CHALLENGING: {main_frame}
+{identity_block}
 
 YOUR ARGUMENTATION STYLE (set by the mediator, independent of culture):
 {challenger_style}
 
-YOUR TASK: Respond to the main agent's reasoning for ONE cell.
+YOU ARE AN INDEPENDENT VOICE:
+{independent_voice}
+
+YOUR TASK: Reason about ONE specific node × dimension cell.
 NODE (facet): {facet}
 DIMENSION: {dimension}
 
-CLASSIFY your response as exactly one of:
-- "challenge": The main agent applied {main_frame} norms as if universal.
-  Be explicit: "The main agent's reasoning depends on [specific norm] being
-  treated as universal. From {challenger_frame}, [explain why it does not apply]."
-- "reframe": Not wrong, but asking the wrong question. State the better question.
-- "confirm": Holds from your frame too. Explain WHY from {challenger_frame}.
+DIMENSION DEFINITIONS:
+- objective: What is the actual goal of reasoning about this node? Is it feasible?
+- query_formulation: Is the question framed correctly? Can it be broken into sub-questions?
+- perspective: What viewpoint is guiding you? Where does it break down?
+- assumptions: What are you taking for granted? Which assumptions are load-bearing?
+- evidence: Which facts support this? Any alternative explanations?
+- concepts: Which cultural frameworks are you applying? Have you quietly adjusted
+  any assumption to fit a preferred theory? If yes, name it.
+- implications: If your reasoning is correct, what specifically follows?
 
-THE MOST IMPORTANT CELLS:
-Find where the main agent treated a {main_frame}-specific norm as a universal
-human fact. When you find one, name it precisely.
+THE MOST IMPORTANT MOVE:
+{most_important_move}
 
-Write 3 to 6 sentences. Stay in {challenger_frame} consistently.
+{naming_block}
+
+Write 3 to 6 sentences. {consistency}Be specific to
+THIS facet and THIS dimension only.
 
 Respond ONLY with valid JSON. No preamble. No markdown fences.
 Return:
 {{
-  "response_type": "challenge" | "reframe" | "confirm",
   "content": "<your reasoning — 3 to 6 sentences>",
   "reflection_flags": []
 }}
@@ -230,21 +330,20 @@ Return:
 
 def challenger_cell_user(
     occurring_json: str,
-    main_cell_content: str,
     facet: str,
     dimension: str,
 ) -> str:
     return f"""\
-Challenge the main agent's reasoning for this cell.
+Reason about this specific node and dimension from within your own standpoint.
 
 FACET: {facet}
 DIMENSION: {dimension}
 
-MAIN AGENT'S REASONING FOR THIS CELL:
-{main_cell_content}
-
-THE OCCURRING (full context):
+THE OCCURRING:
 {occurring_json}
+
+Focus only on the {facet} node as seen through the {dimension} lens, reasoning
+solely from your own standpoint.
 """
 
 
