@@ -35,6 +35,13 @@ JUDGE_MODEL_ID = os.environ.get(
     "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
 )
 
+#embedding model (convergence similarity between cycles). Titan Text Embeddings
+# V2 is invoked via invoke_model, not converse.
+EMBED_MODEL_ID = os.environ.get(
+    "BEDROCK_EMBED_MODEL_ID",
+    "amazon.titan-embed-text-v2:0",
+)
+
 BEDROCK_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 # Network timeouts. We do app-level retries in call_llm, so disable boto3's
@@ -177,6 +184,77 @@ def call_llm(
     raise RuntimeError(
         f"Bedrock call failed after {retries} retries "
         f"(model={model}). Last response was empty or all attempts errored."
+    )
+
+
+@traceable(name="bedrock_embed", run_type="embedding")
+def embed_text(
+    text: str,
+    model: str = EMBED_MODEL_ID,
+    retries: int = 3,
+) -> list[float]:
+    """Embed a single string via Bedrock and return the dense vector.
+
+    Used by the convergence metric to compare the semantic content of two
+    cycles' findings. Reuses the singleton bedrock-runtime client and the same
+    budget / circuit-breaker hooks as call_llm so embedding calls count toward
+    the scenario budget. Titan Text Embeddings V2 is invoked via invoke_model
+    (converse does not support embedding models).
+    """
+    check_budget_before_call()
+
+    client = get_client()
+    body = json.dumps({"inputText": text})
+    for attempt in range(retries):
+        t0 = time.monotonic()
+        try:
+            response = client.invoke_model(modelId=model, body=body)
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            payload = json.loads(response["body"].read())
+            embedding = payload.get("embedding")
+            if not embedding:
+                logger.warning(
+                    f"Embedding model returned no vector on attempt "
+                    f"{attempt+1}/{retries}. Retrying."
+                )
+                time.sleep(2 ** attempt)
+                continue
+            record_success(latency_ms)
+            return embedding
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("ThrottlingException", "TooManyRequestsException"):
+                wait = 2 ** attempt * 5
+                logger.warning(
+                    f"Embedding throttled, waiting {wait}s "
+                    f"(attempt {attempt+1}/{retries})"
+                )
+                time.sleep(wait)
+            elif code == "ValidationException":
+                logger.error(f"Bedrock embedding validation error: {e}")
+                record_failure()
+                raise
+            elif code == "AccessDeniedException":
+                record_failure()
+                raise PermissionError(
+                    f"Bedrock access denied for embedding model {model}. "
+                    f"Check IAM role has bedrock:InvokeModel and the model is enabled."
+                ) from e
+            elif code == "ResourceNotFoundException":
+                record_failure()
+                raise PermissionError(
+                    f"Embedding model '{model}' not enabled in your AWS account. "
+                    f"Go to AWS Console → Bedrock → Model access → enable Amazon Titan."
+                ) from e
+            else:
+                logger.error(f"Bedrock embedding error on attempt {attempt+1}: {e}")
+                if attempt == retries - 1:
+                    record_failure()
+                    raise
+                time.sleep(2 ** attempt)
+    record_failure()
+    raise RuntimeError(
+        f"Bedrock embedding call failed after {retries} retries (model={model})."
     )
 
 

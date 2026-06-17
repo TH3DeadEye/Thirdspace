@@ -1,3 +1,4 @@
+import json
 from pydantic import BaseModel, computed_field
 from typing import Literal
 from pydantic import Field
@@ -135,6 +136,22 @@ class OccurringNode(BaseModel):
     last_updated_cycle: int = 0
 
 
+def _truncate_content(text: str, limit: int = 380) -> str:
+    """Truncate at a word boundary near `limit`, appending an ellipsis.
+
+    Used to shrink the five non-focus nodes in a cell's slim context. Cuts to
+    `limit` chars, backs up to the last space (only if that space is past char
+    100, so very long single tokens still get trimmed), and marks the cut.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    last_space = cut.rfind(" ")
+    if last_space > 100:
+        cut = cut[:last_space]
+    return cut + "…"
+
+
 class TheOccurring(BaseModel):
     scenario_id: str
     raw_scenario: str
@@ -142,6 +159,51 @@ class TheOccurring(BaseModel):
 
     def get_node(self, facet: str) -> OccurringNode | None:
         return next((n for n in self.nodes if n.facet == facet), None)
+
+    def to_nodes_json(self) -> str:
+        """Serialize scenario_id + all six nodes, omitting raw_scenario.
+
+        For phase-level calls (mediation, node_update, generation) that need
+        every node in full but never reference the original raw text. Dropping
+        raw_scenario removes redundant tokens already decomposed into the nodes.
+        """
+        return json.dumps(
+            {
+                "scenario_id": self.scenario_id,
+                "nodes": [n.model_dump() for n in self.nodes],
+            },
+            ensure_ascii=False,
+        )
+
+    def slim_context(self, focus_facet: str) -> str:
+        """Per-cell context: the focus node in full, the other five truncated.
+
+        A cell only reasons about one facet, so the other five nodes are
+        background — their content is truncated to ~380 chars and raw_scenario
+        is dropped entirely. This is the bulk token saving across the
+        NUM_CELLS calls per agent per cycle.
+        """
+        focus = self.get_node(focus_facet)
+        context_summary: dict[str, str] = {
+            n.facet: _truncate_content(n.content)
+            for n in self.nodes
+            if n.facet != focus_facet
+        }
+        return json.dumps(
+            {
+                "focus_node": (
+                    {
+                        "facet": focus.facet,
+                        "content": focus.content,
+                        "assumptions": focus.assumptions,
+                    }
+                    if focus
+                    else None
+                ),
+                "context_summary": context_summary,
+            },
+            ensure_ascii=False,
+        )
 
 
 # --- Phase 2 & 3: Reasoning Grids ---
@@ -289,12 +351,31 @@ class JudgeScore(BaseModel):
     intervention_fidelity: int = Field(ge=1, le=5)  
     reasoning: str
 
+# --- Cultural framing ---
+
+class CultureAxis(BaseModel):
+    """One dimension of a cultural frame, e.g. {dimension: "context", value: "high"}.
+
+    Deliberately open (free-text dimension + value) rather than locked to a fixed
+    taxonomy, so a future Hofstede/Meyer/Hall fine-tune dimension set slots in
+    without a schema change. Suggested axes: directness_of_negative_feedback,
+    context (high/low), power_distance, face_honor_sensitivity, time_orientation.
+    """
+    dimension: str
+    value: str
+
+
+# A cultural frame is either a free-text label (back-compat) or a list of
+# dimensional axes. Empty string / empty list => neutral (no-frame) mode.
+CulturalFrame = str | list[CultureAxis]
+
+
 # --- Session Memory ---
 
 class SessionMemory(BaseModel):
     scenario_id: str
-    main_cultural_frame: str
-    challenger_cultural_frame: str
+    main_cultural_frame: CulturalFrame
+    challenger_cultural_frame: CulturalFrame
     # Argumentation style set by the mediator expert. Independent of the
     # cultural identity above (see PDF item 4: the challenger's procedural
     # style is separate from the role of the cultures involved).
@@ -304,8 +385,9 @@ class SessionMemory(BaseModel):
         "single cultural norm stand in as a universal fact"
     )
     # Working perspective for the challenger. Seeded from challenger_cultural_frame
-    # and updated each cycle from the mediation's implying nodes.
-    active_challenger_perspective: str | None = None
+    # and updated each cycle from the mediation's implying nodes (which produce a
+    # free-text perspective, hence the str arm of the union).
+    active_challenger_perspective: CulturalFrame | None = None
     occurring: TheOccurring | None = None
     main_grids: list[NodeReasoningGrid] = []
     challenger_grids: list[NodeReasoningGrid] = []
@@ -329,9 +411,17 @@ class SessionMemory(BaseModel):
     consensus_plateau_threshold: int = 4
     
         # Structural convergence guard. If the mediator self-declares converged but
-    # the conflict-cell Jaccard vs the previous cycle is below this, treat it as
-    # premature (new conflicts still appearing) and keep looping.
+    # the cross-cycle similarity is below the relevant threshold, treat it as
+    # premature (content still moving) and keep looping.
+    #
+    # convergence_metric selects HOW that similarity is measured:
+    #   "jaccard"   — positional overlap of (facet, dimension) conflict cells.
+    #   "embedding" — cosine of the embedded conflict signatures (content-aware).
+    # Embedding cosine of related text runs higher than Jaccard overlap, so the
+    # two metrics carry separate thresholds.
+    convergence_metric: Literal["jaccard", "embedding"] = "embedding"
     jaccard_convergence_threshold: float = 0.7
+    embedding_convergence_threshold: float = 0.85
 
     # Cost / latency guardrails. call_llm increments llm_calls_made and
     # total_latency_ms on every Bedrock call. BudgetExceeded raises when

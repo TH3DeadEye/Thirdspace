@@ -3,7 +3,7 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, END
 
-from metrics import conflict_jaccard
+from metrics import convergence_similarity
 
 from models import SessionMemory
 from agents import (
@@ -43,6 +43,10 @@ def node_main_agent(state: GraphState) -> GraphState:
         occurring=mem.occurring,
         cultural_frame=mem.main_cultural_frame,
         cycle=cycle,
+        # Cycle 2+: feed the previous mediation's meta-level guidance (reformulated
+        # query, new objective, named assumption corrections) into the cell prompts
+        # so the main agent advances instead of re-deriving the same grid.
+        prior_mediation=mem.mediation_history[-1] if mem.mediation_history else None,
     )
     mem.main_grids.append(grid)
     return {"memory": mem}
@@ -55,9 +59,9 @@ def node_challenger(state: GraphState) -> GraphState:
     # Use the working perspective if the loop has refined one; otherwise fall
     # back to the original cultural frame.
     challenger_frame = mem.active_challenger_perspective or mem.challenger_cultural_frame
+    # The challenger is fully isolated — it does not receive the main agent's grid.
     grid = run_challenger(
         occurring=mem.occurring,
-        main_grid=mem.main_grids[-1],
         challenger_frame=challenger_frame,
         main_frame=mem.main_cultural_frame,
         cycle=cycle,
@@ -180,11 +184,19 @@ def should_loop(state: GraphState) -> str:
 
     if mem.converged:
         if len(history) >= 2:
-            j = conflict_jaccard(history[-2], history[-1])
-            if j < mem.jaccard_convergence_threshold:
+            sim = convergence_similarity(
+                history[-2], history[-1], mem.convergence_metric
+            )
+            threshold = (
+                mem.embedding_convergence_threshold
+                if mem.convergence_metric == "embedding"
+                else mem.jaccard_convergence_threshold
+            )
+            if sim < threshold:
                 logger.info(
-                    f"[{mem.scenario_id}] LLM converged but Jaccard={j:.2f} < "
-                    f"{mem.jaccard_convergence_threshold}; new conflicts, continuing"
+                    f"[{mem.scenario_id}] LLM converged but "
+                    f"{mem.convergence_metric} similarity={sim:.2f} < {threshold}; "
+                    f"content still moving, continuing"
                 )
                 return "evaluate_cycle"
         logger.info(f"[{mem.scenario_id}] Converged at cycle {mem.current_cycle}")

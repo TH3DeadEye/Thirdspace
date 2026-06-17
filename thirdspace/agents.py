@@ -16,12 +16,13 @@ from models import (
     FACET_LIST, DIMENSION_LIST, NUM_FACETS, NUM_CELLS,
     ConflictTypeSummary,
     CONFLICT_TYPE,
+    CulturalFrame,
 )
 from llm import (
     call_llm, call_llm_json, call_llm_json_with_refinement,
     CHALLENGER_MODEL_ID, JUDGE_MODEL_ID,
 )
-from utils.context import compress_historical_context, linearize_grid_to_matrix_map
+from utils.context import compress_historical_context
 from utils.prompts import (
     REFORMULATION_SYSTEM, reformulation_user,
     critical_thinking_cell_system, critical_thinking_cell_user,
@@ -30,6 +31,7 @@ from utils.prompts import (
     MEDIATION_SYSTEM, mediation_user,
     build_constrained_generation_system, constrained_generation_user,
     judge_output_system, judge_cycle_system, judge_user, judge_cycle_user,
+    render_frame,
 )
 from budget import active_memory, get_active_memory
 
@@ -40,6 +42,31 @@ _CELL_WORKERS = max(1, min(int(os.environ.get("THIRDSPACE_CELL_WORKERS", "8")), 
 
 def _cell_pairs() -> list[tuple[str, str]]:
     return [(f, d) for f in FACET_LIST for d in DIMENSION_LIST]
+
+
+def _build_prior_findings(mediation: ImplyingNodes) -> str | None:
+    """Compact, prompt-ready summary of the previous cycle's meta-level guidance.
+
+    node_integrate already folds updated assumptions into The Occurring's
+    content, but the mediation's meta-level direction (reformulated query, new
+    objective) never reaches the cell agents. Surfacing it here lets the CT and
+    Challenger agents reason *differently* in cycle 2+ instead of re-deriving
+    the same grid. Returns None when there is nothing actionable to inject.
+    """
+    parts: list[str] = []
+    if mediation.updated_assumptions:
+        bullets = "\n".join(f"- {a}" for a in mediation.updated_assumptions)
+        parts.append("Updated assumptions from the previous cycle:\n" + bullets)
+    reformulated_query = mediation.wholeness.reformulated_query
+    if reformulated_query:
+        parts.append(f"Reformulated query: {reformulated_query}")
+    new_objective = mediation.wholeness.new_objective
+    if new_objective:
+        parts.append(f"New objective: {new_objective}")
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +200,7 @@ def _ct_cell(
     facet: str,
     dimension: str,
     cycle: int,
+    prior_findings: str | None = None,
 ) -> NodeDimensionCell:
     # ThreadPoolExecutor workers start with a fresh contextvars context, so we
     # re-register the active SessionMemory inside the worker before any LLM
@@ -181,7 +209,9 @@ def _ct_cell(
     with active_memory(memory):
         result = call_llm_json_with_refinement(
             system=critical_thinking_cell_system(cultural_frame, facet, dimension),
-            user=critical_thinking_cell_user(occurring_json, facet, dimension),
+            user=critical_thinking_cell_user(
+                occurring_json, facet, dimension, prior_findings=prior_findings
+            ),
         )
     flags = _parse_flags(result.get("reflection_flags", []))
     meta = result.get("_refinement_meta", {})
@@ -200,10 +230,18 @@ def _ct_cell(
 @traceable(run_type="chain", name="critical_thinking")
 def run_critical_thinking(
     occurring: TheOccurring,
-    cultural_frame: str,
+    cultural_frame: CulturalFrame,
     cycle: int,
+    prior_mediation: ImplyingNodes | None = None,
 ) -> NodeReasoningGrid:
-    occurring_json = occurring.model_dump_json()
+    # Render the frame (string / dimensional axes / empty) to a prompt string
+    # once; "" puts the cell prompts into neutral-analyst mode.
+    cultural_frame = render_frame(cultural_frame)
+    # Per-facet slim contexts: each cell gets its focus node in full and the
+    # other five truncated, instead of the entire Occurring (incl. raw_scenario)
+    # on all NUM_CELLS calls.
+    slim_contexts = {facet: occurring.slim_context(facet) for facet in FACET_LIST}
+    prior_findings = _build_prior_findings(prior_mediation) if prior_mediation else None
     pairs = _cell_pairs()
     # Capture the active memory in the main thread; each worker re-registers
     # it on its own thread (see threading note in budget.py).
@@ -216,7 +254,8 @@ def run_critical_thinking(
     with ThreadPoolExecutor(max_workers=_CELL_WORKERS) as ex:
         cells = list(ex.map(
             lambda fd: _ct_cell(
-                memory, occurring_json, cultural_frame, fd[0], fd[1], cycle,
+                memory, slim_contexts[fd[0]], cultural_frame, fd[0], fd[1], cycle,
+                prior_findings=prior_findings,
                 langsmith_extra=_cell_trace_extra(run, "main", fd[0], fd[1], cycle),
             ),
             pairs,
@@ -228,15 +267,17 @@ def run_critical_thinking(
 
 # ---------------------------------------------------------------------------
 # Phase 3 — Challenger
-# Passes the main grid as a linearized matrix map (easier for LLM to read).
-# One LLM call per cell with response_type classification.
+# A fully INDEPENDENT reasoner. It sees only The Occurring and its own cultural
+# frame — never the main agent's grid, the mediation, or prior-cycle findings.
+# It does not classify challenge/reframe/confirm (that was defined relative to
+# the main agent); mediation is where the two independent grids are compared.
+# One LLM call per cell.
 # ---------------------------------------------------------------------------
 
 @traceable(run_type="chain")
 def _challenger_cell(
     memory,  # SessionMemory | None — captured in the parent thread
     occurring_json: str,
-    main_matrix: dict,
     challenger_frame: str,
     main_frame: str,
     challenger_style: str,
@@ -244,7 +285,6 @@ def _challenger_cell(
     dimension: str,
     cycle: int,
 ) -> NodeDimensionCell:
-    main_cell_content = main_matrix.get(facet, {}).get(dimension, {}).get("content", "")
     # Re-register the active memory on this worker thread (see _ct_cell).
     with active_memory(memory):
         result = call_llm_json_with_refinement(
@@ -253,7 +293,6 @@ def _challenger_cell(
             ),
             user=challenger_cell_user(
                 occurring_json=occurring_json,
-                main_cell_content=main_cell_content,
                 facet=facet,
                 dimension=dimension,
             ),
@@ -266,7 +305,9 @@ def _challenger_cell(
         dimension=dimension,
         content=result["content"],
         reflection_flags=flags,
-        response_type=result.get("response_type"),
+        # The blind challenger does not classify against the main agent; mediation
+        # derives the relationship between the two grids. response_type stays None.
+        response_type=None,
         cycle_last_updated=cycle,
         refinement_attempts=int(meta.get("attempts", 0)),
         refinement_reasons=list(meta.get("reasons", [])),
@@ -276,26 +317,25 @@ def _challenger_cell(
 @traceable(run_type="chain", name="challenger")
 def run_challenger(
     occurring: TheOccurring,
-    main_grid: NodeReasoningGrid,
-    challenger_frame: str,
-    main_frame: str,
+    challenger_frame: CulturalFrame,
+    main_frame: CulturalFrame,
     cycle: int,
     challenger_style: str,
 ) -> NodeReasoningGrid:
+    # The challenger is fully isolated: it never receives the main agent's grid,
+    # the mediation, or prior-cycle findings — only The Occurring and its own
+    # frame. Mediation is where the two independent grids are compared.
+    #
     # Future RAG/retrieval would plug in here: enrich the user prompt per cell
     # with retrieved context scoped to challenger_frame. Wire it up by editing
     # _challenger_cell when a corpus and retriever exist.
-    occurring_json = occurring.model_dump_json()
-    main_cells_raw = [
-        {
-            "facet": c.facet,
-            "dimension": c.dimension,
-            "content": c.content,
-            "reflection_flags": [f.model_dump() for f in c.reflection_flags],
-        }
-        for c in main_grid.cells
-    ]
-    main_matrix = linearize_grid_to_matrix_map(main_cells_raw)
+    #
+    # Render both frames once; "" puts the cell prompts into neutral mode. The
+    # challenger still knows the contrasting frame's name (main_frame) — that's
+    # scenario context, not the main agent's reasoning.
+    challenger_frame = render_frame(challenger_frame)
+    main_frame = render_frame(main_frame)
+    slim_contexts = {facet: occurring.slim_context(facet) for facet in FACET_LIST}
 
     pairs = _cell_pairs()
     memory = get_active_memory()
@@ -309,7 +349,7 @@ def run_challenger(
         cells = list(ex.map(
             lambda fd: _challenger_cell(
                 memory,
-                occurring_json, main_matrix,
+                slim_contexts[fd[0]],
                 challenger_frame, main_frame, challenger_style,
                 fd[0], fd[1], cycle,
                 langsmith_extra=_cell_trace_extra(run, "challenger", fd[0], fd[1], cycle),
@@ -335,9 +375,11 @@ def run_mediation(
     all_mediation_history: list[ImplyingNodes],
     cycle: int,
 ) -> ImplyingNodes:
-    occurring_json = occurring.model_dump_json()
+    occurring_json = occurring.to_nodes_json()
 
-    # Nest by facet instead of flat list — easier for LLM to scan
+    # Nest by facet instead of flat list — easier for LLM to scan. The two grids
+    # are produced independently (the challenger never saw the main agent), so
+    # the mediator classifies the relationship between each pair itself.
     cell_pairs_by_facet: dict = {}
     for facet in FACET_LIST:
         cell_pairs_by_facet[facet] = {}
@@ -347,7 +389,6 @@ def run_mediation(
             cell_pairs_by_facet[facet][dimension] = {
                 "main": main_cell.content if main_cell else "",
                 "challenger": chall_cell.content if chall_cell else "",
-                "response_type": chall_cell.response_type if chall_cell else None,
             }
     cell_pairs_json = json.dumps(cell_pairs_by_facet, ensure_ascii=False)
 
@@ -430,7 +471,7 @@ def run_node_update(
     result = call_llm_json(
         system=NODE_UPDATE_SYSTEM,
         user=node_update_user(
-            occurring_json=occurring.model_dump_json(),
+            occurring_json=occurring.to_nodes_json(),
             updated_assumptions_json=json.dumps(
                 mediation.updated_assumptions, ensure_ascii=False
             ),
@@ -547,7 +588,7 @@ def run_constrained_generation(
     return call_llm(
         system=build_constrained_generation_system(cross_cycle_summary),
         user=constrained_generation_user(
-            occurring_json=occurring.model_dump_json(),
+            occurring_json=occurring.to_nodes_json(),
             distilled_wholeness_json=json.dumps(distilled, ensure_ascii=False),
             final_mediation_json=final_mediation.model_dump_json(),
             all_findings_json=all_findings_json,

@@ -6,9 +6,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from models import SessionMemory, TheOccurring
+from models import SessionMemory, TheOccurring, CultureAxis, CulturalFrame
 from graph import build_graph
 from budget import set_active_memory, reset_active_memory
+from utils.prompts import render_frame
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,17 +34,23 @@ def persist_session(memory: SessionMemory, output_dir: Path = DEFAULT_OUTPUT_DIR
     return path
 
 
-def _make_scenario_id(raw_scenario: str, main_frame: str, challenger_frame: str) -> str:
+def _make_scenario_id(
+    raw_scenario: str,
+    main_frame: CulturalFrame,
+    challenger_frame: CulturalFrame,
+) -> str:
     """Deterministic 12-char id from the inputs, so re-running the same scenario
-    writes to the same output file (reproducible; no orphaned partial runs)."""
-    content = f"{raw_scenario}|{main_frame}|{challenger_frame}"
+    writes to the same output file (reproducible; no orphaned partial runs).
+    Frames are rendered first so a dimensional frame and its string form produce
+    stable, comparable ids."""
+    content = f"{raw_scenario}|{render_frame(main_frame)}|{render_frame(challenger_frame)}"
     return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 
 def run_scenario(
     raw_scenario: str,
-    main_cultural_frame: str,
-    challenger_cultural_frame: str,
+    main_cultural_frame: CulturalFrame,
+    challenger_cultural_frame: CulturalFrame,
     max_cycles: int = 3,
     challenger_style: str | None = None,
     output_dir: Path | None = DEFAULT_OUTPUT_DIR,
@@ -107,6 +114,28 @@ if __name__ == "__main__":
     I don't understand what I did wrong — I was just being honest and direct.
     """
 
+    # Frames accept three forms (see models.CulturalFrame):
+    #
+    # 1. Free-text label (back-compat) — used below.
+    #
+    # 2. Dimensional axes (matches a Hofstede/Meyer fine-tune; less stereotyping):
+    #    main_cultural_frame=[
+    #        CultureAxis(dimension="directness_of_negative_feedback", value="high / direct"),
+    #        CultureAxis(dimension="context", value="low"),
+    #        CultureAxis(dimension="power_distance", value="low"),
+    #    ],
+    #    challenger_cultural_frame=[
+    #        CultureAxis(dimension="directness_of_negative_feedback", value="low / indirect"),
+    #        CultureAxis(dimension="context", value="high"),
+    #        CultureAxis(dimension="face_honor_sensitivity", value="high"),
+    #    ],
+    #
+    # 3. Neutral baseline (no frame for either agent — drops the frame scaffolding
+    #    and the "name your frame" lines, to test the output-verbosity hypothesis):
+    #    main_cultural_frame="", challenger_cultural_frame="",
+    #
+    # Convergence metric is selectable on SessionMemory (convergence_metric=
+    # "embedding" default, or "jaccard"); run both to A/B the loop behavior.
     memory = run_scenario(
         raw_scenario=scenario,
         main_cultural_frame="Canadian low-context direct communication culture",

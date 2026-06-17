@@ -104,16 +104,17 @@ class TestCriticalThinking(unittest.TestCase):
 
 
 class TestChallenger(unittest.TestCase):
-    def test_response_type_propagates(self):
+    def test_independent_grid_has_no_response_type(self):
+        # The challenger is blind to the main agent: it produces an independent
+        # grid and does NOT classify challenge/reframe/confirm. response_type is
+        # always None, even if the model erroneously emits one.
         agents.call_llm_json_with_refinement = lambda **k: {
             "content": "One. Two. Three.",
             "reflection_flags": [],
             "response_type": "challenge",
         }
-        main_grid = make_grid("main", 0)
         grid = agents.run_challenger(
             occurring=make_occurring(),
-            main_grid=main_grid,
             challenger_frame="X",
             main_frame="Y",
             cycle=0,
@@ -121,7 +122,7 @@ class TestChallenger(unittest.TestCase):
         )
         self.assertEqual(grid.agent, "challenger")
         self.assertEqual(len(grid.cells), NUM_CELLS)
-        self.assertTrue(all(c.response_type == "challenge" for c in grid.cells))
+        self.assertTrue(all(c.response_type is None for c in grid.cells))
 
 
 class TestMediation(unittest.TestCase):
