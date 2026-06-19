@@ -16,7 +16,7 @@ from models import (
     FACET_LIST, DIMENSION_LIST, NUM_FACETS, NUM_CELLS,
     ConflictTypeSummary,
     CONFLICT_TYPE,
-    CulturalFrame,
+    CulturalFrame, CultureAxis, DetectedFrames, CULTURE_DIMENSION_MENU,
 )
 from llm import (
     call_llm, call_llm_json, call_llm_json_with_refinement,
@@ -24,6 +24,7 @@ from llm import (
 )
 from utils.context import compress_historical_context
 from utils.prompts import (
+    FRAME_DETECTION_SYSTEM, frame_detection_user, render_dimension_menu,
     REFORMULATION_SYSTEM, reformulation_user,
     critical_thinking_cell_system, critical_thinking_cell_user,
     challenger_cell_system, challenger_cell_user,
@@ -113,6 +114,98 @@ def _parse_flags(raw_flags: list) -> list[ReflectionFlag]:
         elif isinstance(f, str) and f.strip():
             flags.append(ReflectionFlag(measure=f.strip(), issue="flagged by model"))
     return flags
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 — Cultural frame detection
+# Infers two contrasting dimensional frames from the raw scenario, constrained
+# to CULTURE_DIMENSION_MENU. Runs only when run_scenario was called with no
+# explicit frames (auto-detect / production path).
+# ---------------------------------------------------------------------------
+
+def _validate_axes(raw_axes: list, where: str) -> list[CultureAxis]:
+    """Keep only axes whose dimension is a menu key and whose value is one of
+    that dimension's allowed values (case-insensitive, trimmed). Invalid axes
+    are dropped with a log line; the canonical menu value is restored so
+    cross-frame comparisons stay exact. Duplicate dimensions: first valid wins.
+    """
+    valid: list[CultureAxis] = []
+    seen: set[str] = set()
+    for a in raw_axes or []:
+        if not isinstance(a, dict):
+            logger.warning(f"{where}: skipping non-object axis {a!r}")
+            continue
+        dim = str(a.get("dimension", "")).strip().lower()
+        val = str(a.get("value", "")).strip().lower()
+        allowed = CULTURE_DIMENSION_MENU.get(dim)
+        if allowed is None:
+            logger.warning(f"{where}: dropping unknown dimension {a.get('dimension')!r}")
+            continue
+        match = next((v for v in allowed if v.lower() == val), None)
+        if match is None:
+            logger.warning(
+                f"{where}: dropping illegal value {a.get('value')!r} for "
+                f"dimension {dim!r} (allowed: {allowed})"
+            )
+            continue
+        if dim in seen:
+            continue
+        seen.add(dim)
+        valid.append(CultureAxis(dimension=dim, value=match))
+    return valid
+
+
+def _axes_identical(a: list[CultureAxis], b: list[CultureAxis]) -> bool:
+    """True when both sides assign the same value on the same set of dimensions
+    (degenerate — no cultural contrast left to analyze)."""
+    return {(x.dimension, x.value) for x in a} == {(x.dimension, x.value) for x in b}
+
+
+@traceable(run_type="chain", name="frame_detection")
+def run_frame_detection(raw_scenario: str, scenario_id: str) -> DetectedFrames:
+    menu_str = render_dimension_menu(CULTURE_DIMENSION_MENU)
+    user = frame_detection_user(raw_scenario, menu_str)
+
+    def _attempt(user_prompt: str) -> tuple[list[CultureAxis], list[CultureAxis], str]:
+        result = call_llm_json(system=FRAME_DETECTION_SYSTEM, user=user_prompt)
+        main = _validate_axes(result.get("main", []), where="Frame detection (main)")
+        chall = _validate_axes(
+            result.get("challenger", []), where="Frame detection (challenger)"
+        )
+        return main, chall, str(result.get("rationale", ""))
+
+    main, chall, rationale = _attempt(user)
+
+    # One corrective retry if a side came back empty or the two frames don't
+    # actually contrast (a degenerate frame pair has no conflict to reason about).
+    if not main or not chall or _axes_identical(main, chall):
+        logger.warning(
+            f"[{scenario_id}] Frame detection degenerate "
+            f"(main={len(main)} axes, challenger={len(chall)} axes, "
+            f"identical={_axes_identical(main, chall)}); retrying once."
+        )
+        retry_user = user + (
+            "\n\nYOUR PREVIOUS RESPONSE WAS REJECTED. Use ONLY dimension names and "
+            "values from the menu above, choose 4 to 6 dimensions where the parties "
+            "DIFFER, and give main and challenger CONTRASTING values on those "
+            "dimensions. The two frames must not be identical."
+        )
+        main, chall, rationale = _attempt(retry_user)
+
+    # Production must not crash on a still-empty side. An empty axis list renders
+    # to "" via render_frame, i.e. neutral mode for that side — log it loudly.
+    if not main:
+        logger.error(
+            f"[{scenario_id}] Frame detection: main frame empty after retry; "
+            f"falling back to neutral for the main agent."
+        )
+    if not chall:
+        logger.error(
+            f"[{scenario_id}] Frame detection: challenger frame empty after retry; "
+            f"falling back to neutral for the challenger."
+        )
+
+    return DetectedFrames(main=main, challenger=chall, rationale=rationale)
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +372,6 @@ def _challenger_cell(
     memory,  # SessionMemory | None — captured in the parent thread
     occurring_json: str,
     challenger_frame: str,
-    main_frame: str,
     challenger_style: str,
     facet: str,
     dimension: str,
@@ -289,7 +381,7 @@ def _challenger_cell(
     with active_memory(memory):
         result = call_llm_json_with_refinement(
             system=challenger_cell_system(
-                challenger_frame, main_frame, challenger_style, facet, dimension
+                challenger_frame, challenger_style, facet, dimension
             ),
             user=challenger_cell_user(
                 occurring_json=occurring_json,
@@ -318,23 +410,20 @@ def _challenger_cell(
 def run_challenger(
     occurring: TheOccurring,
     challenger_frame: CulturalFrame,
-    main_frame: CulturalFrame,
     cycle: int,
     challenger_style: str,
 ) -> NodeReasoningGrid:
     # The challenger is fully isolated: it never receives the main agent's grid,
-    # the mediation, or prior-cycle findings — only The Occurring and its own
-    # frame. Mediation is where the two independent grids are compared.
+    # the main agent's frame, the mediation, or prior-cycle findings — only The
+    # Occurring and its own frame. Mediation is where the two independent grids
+    # are compared.
     #
     # Future RAG/retrieval would plug in here: enrich the user prompt per cell
     # with retrieved context scoped to challenger_frame. Wire it up by editing
     # _challenger_cell when a corpus and retriever exist.
     #
-    # Render both frames once; "" puts the cell prompts into neutral mode. The
-    # challenger still knows the contrasting frame's name (main_frame) — that's
-    # scenario context, not the main agent's reasoning.
+    # Render the frame once; "" puts the cell prompts into neutral mode.
     challenger_frame = render_frame(challenger_frame)
-    main_frame = render_frame(main_frame)
     slim_contexts = {facet: occurring.slim_context(facet) for facet in FACET_LIST}
 
     pairs = _cell_pairs()
@@ -343,14 +432,14 @@ def run_challenger(
     if run is not None:
         run.add_metadata({
             "cycle": cycle, "agent": "challenger",
-            "challenger_frame": challenger_frame, "main_frame": main_frame,
+            "challenger_frame": challenger_frame,
         })
     with ThreadPoolExecutor(max_workers=_CELL_WORKERS) as ex:
         cells = list(ex.map(
             lambda fd: _challenger_cell(
                 memory,
                 slim_contexts[fd[0]],
-                challenger_frame, main_frame, challenger_style,
+                challenger_frame, challenger_style,
                 fd[0], fd[1], cycle,
                 langsmith_extra=_cell_trace_extra(run, "challenger", fd[0], fd[1], cycle),
             ),

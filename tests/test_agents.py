@@ -116,7 +116,6 @@ class TestChallenger(unittest.TestCase):
         grid = agents.run_challenger(
             occurring=make_occurring(),
             challenger_frame="X",
-            main_frame="Y",
             cycle=0,
             challenger_style="procedural",
         )

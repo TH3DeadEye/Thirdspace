@@ -14,7 +14,9 @@ for p in (_ROOT, _ROOT / "thirdspace"):
 
 import graph as g
 import metrics
-from models import SessionMemory, JudgeScore, ImplyingNodes
+from models import (
+    SessionMemory, JudgeScore, ImplyingNodes, DetectedFrames, CultureAxis,
+)
 from tests.fixtures import make_occurring, make_grid, make_mediation, make_wholeness
 
 
@@ -27,6 +29,13 @@ def _char_embed(text):
 
 def _install_stubs(g_module, *, low_score: bool = False, max_loop_cycles: int = 2):
     """Replace every agent function bound in graph.py's namespace with a stub."""
+    # Only exercised when auto_detect_frames=True (passthrough otherwise), but
+    # bound here so the auto-detect test has a deterministic detector.
+    g_module.run_frame_detection = lambda raw_scenario, scenario_id: DetectedFrames(
+        main=[CultureAxis(dimension="power_distance", value="low")],
+        challenger=[CultureAxis(dimension="power_distance", value="high")],
+        rationale="stub detection",
+    )
     g_module.run_reformulation = lambda raw_scenario, scenario_id: make_occurring(scenario_id)
     g_module.run_critical_thinking = lambda occurring, cultural_frame, cycle, prior_mediation=None: make_grid("main", cycle)
     g_module.run_challenger = lambda **kw: make_grid("challenger", kw["cycle"])
@@ -265,6 +274,47 @@ class TestEmbeddingConvergence(unittest.TestCase):
         # (Under jaccard, empty conflict sets would have stopped it at cycle 1.)
         self.assertEqual(len(out.mediation_history), 3)
         self.assertEqual(out.final_output, "DOC")
+
+
+class TestAutoDetectFrames(unittest.TestCase):
+    """Phase 0 entry node fills both frames from the scenario when
+    auto_detect_frames=True, and is a passthrough otherwise."""
+
+    def test_detected_frames_populate_before_pipeline(self):
+        _install_stubs(g, low_score=False, max_loop_cycles=1)
+        compiled = g.build_graph()
+        mem = SessionMemory(
+            scenario_id="auto",
+            main_cultural_frame="", challenger_cultural_frame="",
+            active_challenger_perspective="",
+            occurring=make_occurring("auto"),
+            max_cycles=1, convergence_metric="jaccard",
+            auto_detect_frames=True,
+        )
+        out = compiled.invoke({"memory": mem})["memory"]
+        # Detection ran: placeholder frames were overwritten and recorded.
+        self.assertIsNotNone(out.frame_detection)
+        self.assertEqual([a.dimension for a in out.main_cultural_frame], ["power_distance"])
+        self.assertEqual(out.main_cultural_frame[0].value, "low")
+        self.assertEqual(out.challenger_cultural_frame[0].value, "high")
+        # active_challenger_perspective seeded from the detected challenger frame.
+        self.assertEqual(out.active_challenger_perspective[0].value, "high")
+
+    def test_passthrough_leaves_explicit_frames_untouched(self):
+        _install_stubs(g, low_score=False, max_loop_cycles=1)
+        compiled = g.build_graph()
+        mem = SessionMemory(
+            scenario_id="explicit",
+            main_cultural_frame="Frame A", challenger_cultural_frame="Frame B",
+            active_challenger_perspective="Frame B",
+            occurring=make_occurring("explicit"),
+            max_cycles=1, convergence_metric="jaccard",
+            # auto_detect_frames defaults False -> node is a no-op.
+        )
+        out = compiled.invoke({"memory": mem})["memory"]
+        self.assertIsNone(out.frame_detection)
+        self.assertEqual(out.main_cultural_frame, "Frame A")
+        self.assertEqual(out.challenger_cultural_frame, "Frame B")
 
 
 if __name__ == "__main__":

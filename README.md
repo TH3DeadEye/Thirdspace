@@ -148,6 +148,21 @@ print(memory.final_output)
 print(f"Calls: {memory.llm_calls_made}, Latency: {memory.total_latency_ms / 1000:.1f}s")
 ```
 
+### Frame modes
+
+The frame arguments control how each agent's cultural lens is set:
+
+- **Auto-detect (production default)** — omit both frames
+  (`run_scenario(raw_scenario="...")`). A Phase 0 step infers both frames from
+  the scenario, constrained to `CULTURE_DIMENSION_MENU` (Hofstede 6, binary
+  high/low). The detected axes + rationale are saved under `frame_detection` in
+  the output JSON.
+- **Explicit** — pass a free-text label (as above) or a list of
+  `CultureAxis(dimension=..., value=...)` axes for controlled experiments.
+- **Neutral baseline** — pass `main_cultural_frame=""`, `challenger_cultural_frame=""`
+  to run with no frame at all. `""` (force neutral) is distinct from omitting the
+  args (auto-detect).
+
 ---
 
 ## Run tests

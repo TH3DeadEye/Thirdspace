@@ -7,6 +7,7 @@ from metrics import convergence_similarity
 
 from models import SessionMemory
 from agents import (
+    run_frame_detection,
     run_reformulation,
     run_critical_thinking,
     run_challenger,
@@ -22,6 +23,30 @@ logger = logging.getLogger(__name__)
 
 class GraphState(TypedDict):
     memory: SessionMemory
+
+
+def node_detect_frames(state: GraphState) -> GraphState:
+    """Phase 0: infer both cultural frames from the raw scenario.
+
+    Static, always-present entry node. It only does work when the caller passed
+    no explicit frames (auto_detect_frames=True); otherwise it is a passthrough,
+    so explicit-frame and neutral runs are unaffected. A detected side with an
+    empty axis list renders to "" downstream (neutral mode for that side)."""
+    mem = state["memory"]
+    if not mem.auto_detect_frames:
+        return {"memory": mem}
+    logger.info(f"[{mem.scenario_id}] Phase 0: Frame detection")
+    detected = run_frame_detection(
+        raw_scenario=mem.occurring.raw_scenario,
+        scenario_id=mem.scenario_id,
+    )
+    mem.main_cultural_frame = detected.main
+    mem.challenger_cultural_frame = detected.challenger
+    # Seed the working perspective from the detected challenger frame; the loop
+    # refines it (mirrors run_scenario's seeding for the explicit-frame path).
+    mem.active_challenger_perspective = detected.challenger
+    mem.frame_detection = detected
+    return {"memory": mem}
 
 
 def node_reformulate(state: GraphState) -> GraphState:
@@ -59,11 +84,11 @@ def node_challenger(state: GraphState) -> GraphState:
     # Use the working perspective if the loop has refined one; otherwise fall
     # back to the original cultural frame.
     challenger_frame = mem.active_challenger_perspective or mem.challenger_cultural_frame
-    # The challenger is fully isolated — it does not receive the main agent's grid.
+    # The challenger is fully isolated — it does not receive the main agent's grid
+    # or the main agent's frame, only The Occurring and its own frame.
     grid = run_challenger(
         occurring=mem.occurring,
         challenger_frame=challenger_frame,
-        main_frame=mem.main_cultural_frame,
         cycle=cycle,
         challenger_style=mem.challenger_style,
     )
@@ -242,6 +267,7 @@ def should_regenerate(state: GraphState) -> str:
 def build_graph() -> StateGraph:
     graph = StateGraph(GraphState)
 
+    graph.add_node("detect_frames", node_detect_frames)
     graph.add_node("reformulate", node_reformulate)
     graph.add_node("main_agent", node_main_agent)
     graph.add_node("challenger", node_challenger)
@@ -251,7 +277,8 @@ def build_graph() -> StateGraph:
     graph.add_node("generate", node_generate)
     graph.add_node("judge", node_judge)
 
-    graph.set_entry_point("reformulate")
+    graph.set_entry_point("detect_frames")
+    graph.add_edge("detect_frames", "reformulate")
     graph.add_edge("reformulate", "main_agent")
     graph.add_edge("main_agent", "challenger")
     graph.add_edge("challenger", "mediation")

@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import Field
 from pydantic import field_validator, model_validator
 from collections import Counter
+import difflib
+
 # --- Constants (never use raw integers in logic) ---
 NUM_FACETS = 6
 NUM_DIMENSIONS = 7
@@ -370,12 +372,42 @@ class CultureAxis(BaseModel):
 CulturalFrame = str | list[CultureAxis]
 
 
+# Bounded menu the Phase 0 frame detector must pick from. Each dimension maps to
+# its two allowed (binary) values. Picking from a fixed menu — rather than letting
+# the model invent dimensions — keeps the vocabulary aligned with the planned
+# Hofstede fine-tune and makes detected frames validatable. Seeded with Hofstede's
+# six dimensions; edit this one constant when the fine-tune schema is final.
+CULTURE_DIMENSION_MENU: dict[str, tuple[str, str]] = {
+    "power_distance":        ("high", "low"),
+    "individualism":         ("individualist", "collectivist"),
+    "masculinity":           ("masculine", "feminine"),
+    "uncertainty_avoidance": ("high", "low"),
+    "long_term_orientation": ("long", "short"),
+    "indulgence":            ("indulgent", "restrained"),
+}
+
+
+class DetectedFrames(BaseModel):
+    """Output of Phase 0 frame detection: two contrasting dimensional frames
+    inferred from the raw scenario, plus the model's rationale (persisted for
+    audit so a human can check which axes/values were chosen and why)."""
+    main: list[CultureAxis]
+    challenger: list[CultureAxis]
+    rationale: str
+
+
 # --- Session Memory ---
 
 class SessionMemory(BaseModel):
     scenario_id: str
     main_cultural_frame: CulturalFrame
     challenger_cultural_frame: CulturalFrame
+    # When true, Phase 0 (detect_frames) infers both frames from the raw scenario
+    # and overwrites the placeholder frames above. Set by run_scenario when the
+    # caller passes no frames (production path). frame_detection records the
+    # detector's output (axes + rationale) for audit; None when detection was skipped.
+    auto_detect_frames: bool = False
+    frame_detection: "DetectedFrames | None" = None
     # Argumentation style set by the mediator expert. Independent of the
     # cultural identity above (see PDF item 4: the challenger's procedural
     # style is separate from the role of the cultures involved).
