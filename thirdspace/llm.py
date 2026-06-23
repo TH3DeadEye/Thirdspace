@@ -44,21 +44,6 @@ EMBED_MODEL_ID = os.environ.get(
 
 BEDROCK_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
-# Bedrock model families that reject the Converse `system` field. For these the
-# system prompt must be folded into the user turn. Matched as substrings against
-# the model id (after stripping any cross-region "us." inference-profile prefix).
-_NO_SYSTEM_MESSAGE_FAMILIES = (
-    "mistral.mistral-7b",
-    "mistral.mixtral",
-    "amazon.titan-text",
-)
-
-
-def _supports_system_messages(model: str) -> bool:
-    """False for models whose Converse API rejects a `system` message."""
-    normalized = model.split(".", 1)[1] if model.startswith("us.") else model
-    return not any(fam in normalized for fam in _NO_SYSTEM_MESSAGE_FAMILIES)
-
 # Network timeouts. We do app-level retries in call_llm, so disable boto3's
 # built-in retry layer to avoid double-retrying (and double-billing) every
 # transient failure.
@@ -135,22 +120,12 @@ def call_llm(
     check_budget_before_call()
 
     client = get_client()
-    if _supports_system_messages(model):
-        request = {
-            "modelId": model,
-            "system": [{"text": system}],
-            "messages": [{"role": "user", "content": [{"text": user}]}],
-            "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
-        }
-    else:
-        # Some Bedrock models (e.g. Mistral 7B / Mixtral 8x7B) reject the
-        # Converse `system` field. Fold the system prompt into the user turn.
-        merged_user = f"{system}\n\n{user}"
-        request = {
-            "modelId": model,
-            "messages": [{"role": "user", "content": [{"text": merged_user}]}],
-            "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
-        }
+    request = {
+        "modelId": model,
+        "system": [{"text": system}],
+        "messages": [{"role": "user", "content": [{"text": user}]}],
+        "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
+    }
     for attempt in range(retries):
         t0 = time.monotonic()
         try:

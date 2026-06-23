@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import Field
 from pydantic import field_validator, model_validator
 from collections import Counter
+from dataclasses import dataclass
 import difflib
 
 # --- Constants (never use raw integers in logic) ---
@@ -66,51 +67,137 @@ RESOLVABILITY = Literal[
     "unresolvable",       # no available standard or evidence
 ]
 
-# What intervention text to inject into generation per type
-INTERVENTION_CLASS: dict[str, str] = {
-    "semantic": (
-        "INTERVENTION CLASS — CONVERSATIONAL RESOLUTION:\n"
-        "Identify the exact word both parties used with different operational meanings. "
-        "Propose a shared definition grounded in the scenario facts. "
-        "Conversational resolution IS appropriate. A single clarifying exchange can dissolve this conflict."
+# ---------------------------------------------------------------------------
+# Conflict-type registry — single source of truth.
+# Validators (forbidden resolvabilities), the generation prompt (intervention
+# text), and any future per-type guidance all resolve from one object per type,
+# instead of parallel dicts that can silently drift out of sync with the Literal.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConflictTypeDefinition:
+    """Everything downstream needs to know about one conflict type."""
+    key: str                              # the string used in JSON and the Literal
+    label: str                            # human-readable name
+    forbidden_resolvabilities: frozenset[str]
+    intervention_text: str                # injected into constrained generation
+    generation_guidance: str              # finer guidance (reserved for the generator)
+
+
+_CONFLICT_REGISTRY: list[ConflictTypeDefinition] = [
+    ConflictTypeDefinition(
+        key="semantic",
+        label="Semantic conflict",
+        forbidden_resolvabilities=frozenset(),
+        intervention_text=(
+            "INTERVENTION CLASS — CONVERSATIONAL RESOLUTION:\n"
+            "Identify the exact word both parties used with different operational meanings. "
+            "Propose a shared definition grounded in the scenario facts. "
+            "Conversational resolution IS appropriate. A single clarifying exchange can dissolve this conflict."
+        ),
+        generation_guidance=(
+            "This is a vocabulary conflict. Name the word(s) at issue and propose "
+            "a shared operational definition. Do not recommend structural change."
+        ),
     ),
-    "attributional": (
-        "INTERVENTION CLASS — FACILITATED PERSPECTIVE RECONSTRUCTION:\n"
-        "Reconstruct each party's causal chain from inside their own cultural frame. "
-        "Do NOT assign blame. Do NOT recommend unilateral dialogue without a facilitator."
+    ConflictTypeDefinition(
+        key="attributional",
+        label="Attributional conflict",
+        forbidden_resolvabilities=frozenset(),
+        intervention_text=(
+            "INTERVENTION CLASS — FACILITATED PERSPECTIVE RECONSTRUCTION:\n"
+            "Reconstruct each party's causal chain from inside their own cultural frame. "
+            "Do NOT assign blame. Do NOT recommend unilateral dialogue without a facilitator."
+        ),
+        generation_guidance=(
+            "Reconstruct both causal chains. Show how each party's chain is internally "
+            "coherent from within their own frame. Do not adjudicate between them."
+        ),
     ),
-    "normative": (
-        "INTERVENTION CLASS — ACKNOWLEDGEMENT OF IRREDUCIBLE DIFFERENCE:\n"
-        "Both positions are internally coherent. Neither will change with more information. "
-        "Options: (a) agree on an external standard neither party authored, "
-        "(b) procedurally separate the normative question from the practical decision, "
-        "(c) name the incompatibility as permanent.\n"
-        "PROHIBITED: Do NOT recommend 'better communication' or 'honest dialogue'. "
-        "The parties already communicate their positions correctly."
+    ConflictTypeDefinition(
+        key="normative",
+        label="Normative conflict",
+        forbidden_resolvabilities=frozenset({"conversational"}),
+        intervention_text=(
+            "INTERVENTION CLASS — ACKNOWLEDGEMENT OF IRREDUCIBLE DIFFERENCE:\n"
+            "Both positions are internally coherent. Neither will change with more information. "
+            "Options: (a) agree on an external standard neither party authored, "
+            "(b) procedurally separate the normative question from the practical decision, "
+            "(c) name the incompatibility as permanent.\n"
+            "PROHIBITED: Do NOT recommend 'better communication' or 'honest dialogue'. "
+            "The parties already communicate their positions correctly."
+        ),
+        generation_guidance=(
+            "Name the incompatible value frameworks explicitly. Offer options: "
+            "(a) agree on an external standard, (b) procedurally separate the normative "
+            "question from the practical decision, (c) name the incompatibility as permanent."
+        ),
     ),
-    "structural": (
-        "INTERVENTION CLASS — SITUATIONAL REDESIGN:\n"
-        "This conflict is generated by the situation's power distribution or institutional constraints — "
-        "NOT by either party's intentions. Removing these individuals and replacing them with any two "
-        "people in the same roles would reproduce this conflict.\n"
-        "Resolution requires: (a) changing the structural constraint, or "
-        "(b) bringing in a third party with authority to alter the structure.\n"
-        "ABSOLUTE PROHIBITION: Do NOT offer dialogue, openness, or honest communication as the remedy. "
-        "This is the false resolution trap."
+    ConflictTypeDefinition(
+        key="structural",
+        label="Structural conflict",
+        forbidden_resolvabilities=frozenset({"conversational", "facilitated"}),
+        intervention_text=(
+            "INTERVENTION CLASS — SITUATIONAL REDESIGN:\n"
+            "This conflict is generated by the situation's power distribution or institutional constraints — "
+            "NOT by either party's intentions. Removing these individuals and replacing them with any two "
+            "people in the same roles would reproduce this conflict.\n"
+            "Resolution requires: (a) changing the structural constraint, or "
+            "(b) bringing in a third party with authority to alter the structure.\n"
+            "ABSOLUTE PROHIBITION: Do NOT offer dialogue, openness, or honest communication as the remedy. "
+            "This is the false resolution trap."
+        ),
+        generation_guidance=(
+            "Identify the structural constraint generating this conflict. Specify what "
+            "redesign would be required. Name the authority needed to enact it."
+        ),
     ),
-    "factual": (
-        "INTERVENTION CLASS — EVIDENCE STANDARD:\n"
-        "Identify exactly which facts are disputed. Specify what evidence would be probative. "
-        "If no evidence exists, state the factual dispute is unresolvable. That itself is a finding."
+    ConflictTypeDefinition(
+        key="factual",
+        label="Factual conflict",
+        forbidden_resolvabilities=frozenset({"conversational", "facilitated"}),
+        intervention_text=(
+            "INTERVENTION CLASS — EVIDENCE STANDARD:\n"
+            "Identify exactly which facts are disputed. Specify what evidence would be probative. "
+            "If no evidence exists, state the factual dispute is unresolvable. That itself is a finding."
+        ),
+        generation_guidance=(
+            "Name the disputed facts precisely. Specify the evidence that would resolve "
+            "them. If no such evidence exists or is available, say so explicitly."
+        ),
     ),
+]
+
+CONFLICT_TYPE_DEFS: dict[str, ConflictTypeDefinition] = {
+    d.key: d for d in _CONFLICT_REGISTRY
 }
 
-# Which resolvability values are forbidden per conflict type
-_FORBIDDEN_RESOLVABILITY: dict[str, frozenset[str]] = {
-    "structural": frozenset({"conversational", "facilitated"}),
-    "normative":  frozenset({"conversational"}),
-    "factual":    frozenset({"conversational", "facilitated"}),
+# Fail fast at import time if the registry and the Literal drift apart.
+_EXPECTED_CONFLICT_KEYS = {"semantic", "attributional", "normative", "structural", "factual"}
+assert set(CONFLICT_TYPE_DEFS) == _EXPECTED_CONFLICT_KEYS, (
+    f"Conflict registry keys {set(CONFLICT_TYPE_DEFS)} != expected {_EXPECTED_CONFLICT_KEYS}"
+)
+
+# Back-compat derived view: existing code and tests import INTERVENTION_CLASS
+# directly. It is now generated from the registry, not maintained separately.
+INTERVENTION_CLASS: dict[str, str] = {
+    k: d.intervention_text for k, d in CONFLICT_TYPE_DEFS.items()
 }
+
+
+def get_intervention_text(conflict_type: str) -> str:
+    defn = CONFLICT_TYPE_DEFS.get(conflict_type)
+    if defn is None:
+        raise KeyError(
+            f"Unknown conflict type '{conflict_type}'. "
+            f"Valid types: {list(CONFLICT_TYPE_DEFS)}"
+        )
+    return defn.intervention_text
+
+
+def get_forbidden_resolvabilities(conflict_type: str) -> frozenset[str]:
+    defn = CONFLICT_TYPE_DEFS.get(conflict_type)
+    return defn.forbidden_resolvabilities if defn else frozenset()
 
 # --- phase 0:identify the type of conflic ---
 
@@ -126,6 +213,84 @@ class ConflictTypeSummary(BaseModel):
     conversational_fraction: float
     unresolvable_fraction: float
     structural_severity_score: float
+    # Scope makes it impossible to confuse a single-cycle summary with the
+    # pooled cross-cycle one — they share a type but mean different things.
+    scope: Literal["cycle", "cross_cycle"] = "cycle"
+    cycles_included: list[int] = []
+
+    @classmethod
+    def from_conflicts(
+        cls,
+        conflicts: list["CellConflict"],
+        scope: Literal["cycle", "cross_cycle"] = "cycle",
+        cycles_included: list[int] | None = None,
+    ) -> "ConflictTypeSummary | None":
+        """Build a summary from a flat list of conflicts. None when empty."""
+        if not conflicts:
+            return None
+        counts: Counter[str] = Counter(c.conflict_type for c in conflicts)
+        total = len(conflicts)
+        return cls(
+            semantic=counts.get("semantic", 0),
+            attributional=counts.get("attributional", 0),
+            normative=counts.get("normative", 0),
+            structural=counts.get("structural", 0),
+            factual=counts.get("factual", 0),
+            total=total,
+            dominant_type=counts.most_common(1)[0][0],
+            structural_fraction=counts.get("structural", 0) / total,
+            conversational_fraction=sum(
+                1 for c in conflicts if c.resolvability == "conversational"
+            ) / total,
+            unresolvable_fraction=sum(
+                1 for c in conflicts if c.resolvability == "unresolvable"
+            ) / total,
+            structural_severity_score=sum(
+                c.severity for c in conflicts if c.conflict_type == "structural"
+            ) / (5 * total),
+            scope=scope,
+            cycles_included=sorted(cycles_included or []),
+        )
+
+    @classmethod
+    def aggregate(
+        cls, per_cycle_summaries: list["ConflictTypeSummary | None"]
+    ) -> "ConflictTypeSummary | None":
+        """Pool pre-computed per-cycle summaries into a cross-cycle summary.
+
+        Adds counts directly from the per-cycle summaries instead of re-flattening
+        the original conflict lists. The fraction fields are weighted by each
+        cycle's total, which is exact: frac_i * total_i == the raw count in cycle i,
+        so the weighted mean equals the pooled fraction.
+        """
+        summaries = [s for s in per_cycle_summaries if s is not None]
+        total = sum(s.total for s in summaries)
+        if total == 0:
+            return None
+        counts = {
+            "semantic": sum(s.semantic for s in summaries),
+            "attributional": sum(s.attributional for s in summaries),
+            "normative": sum(s.normative for s in summaries),
+            "structural": sum(s.structural for s in summaries),
+            "factual": sum(s.factual for s in summaries),
+        }
+        return cls(
+            **counts,
+            total=total,
+            dominant_type=max(counts, key=counts.get),
+            structural_fraction=counts["structural"] / total,
+            conversational_fraction=sum(
+                s.conversational_fraction * s.total for s in summaries
+            ) / total,
+            unresolvable_fraction=sum(
+                s.unresolvable_fraction * s.total for s in summaries
+            ) / total,
+            structural_severity_score=sum(
+                s.structural_severity_score * s.total for s in summaries
+            ) / total,
+            scope="cross_cycle",
+            cycles_included=sorted({c for s in summaries for c in s.cycles_included}),
+        )
 
 
 # --- Phase 1: The Occurring ---
@@ -136,6 +301,16 @@ class OccurringNode(BaseModel):
     content: str
     assumptions: list[str]
     last_updated_cycle: int = 0
+
+
+def _content_similarity(a: str, b: str) -> float:
+    """SequenceMatcher ratio: 1.0 = identical, 0.0 = nothing in common.
+
+    Fast enough for 6-node comparisons; no external deps. Used by the node
+    update to measure the actual delta between cycles instead of trusting the
+    model's self-reported `changed` flag.
+    """
+    return difflib.SequenceMatcher(None, a.strip(), b.strip()).ratio()
 
 
 def _truncate_content(text: str, limit: int = 380) -> str:
@@ -152,6 +327,27 @@ def _truncate_content(text: str, limit: int = 380) -> str:
     if last_space > 100:
         cut = cut[:last_space]
     return cut + "…"
+
+
+def _slim_budget_per_node(
+    nodes: list["OccurringNode"],
+    focus_facet: str,
+    total_context_chars: int = 4000,
+    focus_fraction: float = 0.5,
+) -> dict[str, int]:
+    """Allocate a character budget across nodes for a cell's slim context.
+
+    The focus node gets `focus_fraction` of the total; the remaining nodes split
+    the rest equally. Returns {facet: char_limit}. Replaces the flat 380-char cap
+    with a budget that scales with the configured total.
+    """
+    focus_budget = int(total_context_chars * focus_fraction)
+    n_others = len(nodes) - 1
+    other_budget = int((total_context_chars * (1 - focus_fraction)) / max(n_others, 1))
+    return {
+        n.facet: focus_budget if n.facet == focus_facet else other_budget
+        for n in nodes
+    }
 
 
 class TheOccurring(BaseModel):
@@ -177,17 +373,21 @@ class TheOccurring(BaseModel):
             ensure_ascii=False,
         )
 
-    def slim_context(self, focus_facet: str) -> str:
-        """Per-cell context: the focus node in full, the other five truncated.
+    def slim_context(self, focus_facet: str, total_context_chars: int = 4000) -> str:
+        """Per-cell context with proportional budget allocation.
 
         A cell only reasons about one facet, so the other five nodes are
-        background — their content is truncated to ~380 chars and raw_scenario
-        is dropped entirely. This is the bulk token saving across the
-        NUM_CELLS calls per agent per cycle.
+        background and raw_scenario is dropped entirely — the bulk token saving
+        across the NUM_CELLS calls per agent per cycle. The focus node is sent in
+        full; the other five share a budget (default 4000 chars total → focus
+        gets ~50%, others ~400 chars each). `truncated_nodes` tells the cell agent
+        exactly which background nodes were cut, so it can caveat any reasoning
+        that leans on a truncated node.
         """
         focus = self.get_node(focus_facet)
+        budgets = _slim_budget_per_node(self.nodes, focus_facet, total_context_chars)
         context_summary: dict[str, str] = {
-            n.facet: _truncate_content(n.content)
+            n.facet: _truncate_content(n.content, limit=budgets[n.facet])
             for n in self.nodes
             if n.facet != focus_facet
         }
@@ -196,16 +396,57 @@ class TheOccurring(BaseModel):
                 "focus_node": (
                     {
                         "facet": focus.facet,
-                        "content": focus.content,
+                        "content": focus.content,  # always full — no truncation
                         "assumptions": focus.assumptions,
                     }
                     if focus
                     else None
                 ),
                 "context_summary": context_summary,
+                "context_budget": {
+                    "focus_chars": len(focus.content) if focus else 0,
+                    "other_chars_per_node": {
+                        f: budgets[f] for f in context_summary
+                    },
+                    "truncated_nodes": [
+                        f for f in context_summary
+                        if len(self.get_node(f).content) > budgets[f]
+                    ],
+                },
             },
             ensure_ascii=False,
         )
+
+
+class NodeUpdateDelta(BaseModel):
+    """Audit record for one node's update in a cycle.
+
+    Makes both silent drift (model reworded a node it claimed was unchanged) and
+    silent suppression (model wanted to change a node but was overridden) visible
+    by recording the measured similarity alongside the model's self-report.
+    """
+    facet: FACETS
+    similarity: float          # 1.0 = unchanged, 0.0 = completely rewritten
+    model_claimed_changed: bool
+    actually_changed: bool     # derived from the similarity thresholds
+    content_kept: str          # what actually went into the next cycle
+    content_proposed: str      # what the model returned (for audit)
+    conflict: bool             # model's flag disagreed with measured similarity
+
+
+class TheOccurringUpdateResult(BaseModel):
+    """Returned by run_node_update instead of a bare TheOccurring."""
+    occurring: TheOccurring
+    deltas: list[NodeUpdateDelta]
+
+    @property
+    def any_meaningful_change(self) -> bool:
+        return any(d.actually_changed for d in self.deltas)
+
+    @property
+    def conflicted_nodes(self) -> list[str]:
+        """Facets where the model's changed flag disagreed with the measurement."""
+        return [d.facet for d in self.deltas if d.conflict]
 
 
 # --- Phase 2 & 3: Reasoning Grids ---
@@ -282,7 +523,7 @@ class CellConflict(BaseModel):
 
     @model_validator(mode="after")
     def resolvability_consistent_with_type(self) -> "CellConflict":
-        forbidden = _FORBIDDEN_RESOLVABILITY.get(self.conflict_type, frozenset())
+        forbidden = get_forbidden_resolvabilities(self.conflict_type)
         if self.resolvability in forbidden:
             raise ValueError(
                 f"resolvability='{self.resolvability}' is inconsistent with "
@@ -314,32 +555,42 @@ class ImplyingNodes(BaseModel):
 
     @model_validator(mode="after")
     def compute_type_summary(self) -> "ImplyingNodes":
-        if not self.conflicts:
-            self.conflict_type_summary = None
-            return self
-        counts: Counter[str] = Counter(c.conflict_type for c in self.conflicts)
-        total = len(self.conflicts)
-        dominant = counts.most_common(1)[0][0]
-        self.conflict_type_summary = ConflictTypeSummary(
-            semantic=counts.get("semantic", 0),
-            attributional=counts.get("attributional", 0),
-            normative=counts.get("normative", 0),
-            structural=counts.get("structural", 0),
-            factual=counts.get("factual", 0),
-            total=total,
-            dominant_type=dominant,
-            structural_fraction=counts.get("structural", 0) / total,
-            conversational_fraction=sum(
-                1 for c in self.conflicts if c.resolvability == "conversational"
-            ) / total,
-            unresolvable_fraction=sum(
-                1 for c in self.conflicts if c.resolvability == "unresolvable"
-            ) / total,
-            structural_severity_score=sum(
-                c.severity for c in self.conflicts if c.conflict_type == "structural"
-            ) / (5 * total),
+        self.conflict_type_summary = ConflictTypeSummary.from_conflicts(
+            self.conflicts, scope="cycle", cycles_included=[self.cycle]
         )
         return self
+
+    def to_cell_context(self, cycle: int) -> dict | None:
+        """Structured, labeled guidance for injection into the next cycle's cells.
+
+        Replaces the lossy prose round-trip of _build_prior_findings: the cell
+        agent receives named fields it can reason about by name instead of an
+        unlabeled paragraph. Includes updated_assumptions (which live on
+        ImplyingNodes, not wholeness — the reason this method is here and not on
+        WholenessImplyingNodes). Returns None when nothing is actionable.
+        """
+        w = self.wholeness
+        guidance: dict = {}
+        if w.reformulated_query:
+            guidance["reformulated_query"] = w.reformulated_query
+        if w.new_objective:
+            guidance["new_objective"] = w.new_objective
+        if w.query_assumptions:
+            guidance["query_assumptions"] = w.query_assumptions
+        if w.objective_assumptions:
+            guidance["objective_assumptions"] = w.objective_assumptions
+        if self.updated_assumptions:
+            guidance["updated_assumptions"] = self.updated_assumptions
+        if not guidance:
+            return None
+        return {
+            "from_cycle": cycle,
+            "guidance": guidance,
+            "_note": (
+                "This guidance was produced by the mediator in the previous cycle. "
+                "Use it to refine your analysis — do not simply repeat it."
+            ),
+        }
 
 
 # --- LLM-as-a-judge scores ---
@@ -372,6 +623,66 @@ class CultureAxis(BaseModel):
 CulturalFrame = str | list[CultureAxis]
 
 
+class CulturalIdentity(BaseModel):
+    """A party's cultural frame — set once at scenario creation, never overwritten.
+
+    Identity (who a party is culturally) is deliberately separated from the
+    mediator's evolving working perspective (how that party is reasoning in this
+    specific conflict). Storing both in one CulturalFrame-typed field let a
+    free-text mediator string silently overwrite the structured dimensional axes
+    across cycles; keeping identity in its own immutable, structured type makes
+    that impossible. Prefer dimensional `axes`; `label` is a free-text fallback.
+    """
+    axes: list[CultureAxis] = []
+    label: str = ""  # free-text fallback; ignored when axes is non-empty
+
+    @classmethod
+    def from_frame(cls, frame: "CulturalFrame") -> "CulturalIdentity":
+        """Construct from the legacy CulturalFrame union (str or list of axes)."""
+        if isinstance(frame, list):
+            return cls(axes=frame, label="")
+        return cls(axes=[], label=frame or "")
+
+    @property
+    def is_neutral(self) -> bool:
+        return not self.axes and not self.label
+
+    @property
+    def is_dimensional(self) -> bool:
+        return bool(self.axes)
+
+    def render(self) -> str:
+        """Stable prompt string. "" => neutral (no-frame) mode downstream."""
+        if self.is_neutral:
+            return ""
+        if self.is_dimensional:
+            return "; ".join(f"{a.dimension}: {a.value}" for a in self.axes)
+        return self.label
+
+
+class WorkingPerspective(BaseModel):
+    """The mediator's evolving read on how a party is reasoning in this conflict.
+
+    Updated each cycle from WholenessImplyingNodes.updated_challenger_perspective.
+    Always prose — the mediator's interpretation, never the party's identity.
+    `prose is None` until the first refinement, where the identity renders alone.
+    """
+    cycle_last_updated: int = 0
+    prose: str | None = None
+
+    def render_for_prompt(self, identity: "CulturalIdentity") -> str:
+        """Identity is always present; the mediating perspective is additive."""
+        identity_str = identity.render()
+        if self.prose is None:
+            return identity_str
+        if not identity_str:
+            return self.prose
+        return (
+            f"{identity_str}\n\n"
+            f"Mediating perspective (cycle {self.cycle_last_updated}): {self.prose}"
+        )
+
+
 # Bounded menu the Phase 0 frame detector must pick from. Each dimension maps to
 # its two allowed (binary) values. Picking from a fixed menu — rather than letting
 # the model invent dimensions — keeps the vocabulary aligned with the planned
@@ -398,6 +709,44 @@ class DetectedFrames(BaseModel):
 
 # --- Session Memory ---
 
+class CompressedHistoryEntry(BaseModel):
+    """One cycle's mediation distilled to what future cycles actually need.
+
+    Full ImplyingNodes stays on mediation_history for audit/output; this is the
+    stripped view used for prompt injection. Built once per cycle and appended to
+    SessionMemory.compressed_history (O(1) per cycle), so the mediator prompt
+    never re-flattens the whole history on every call.
+    """
+    cycle: int
+    dominant_conflict_type: str | None
+    agreement_count: int
+    conflict_count: int
+    key_agreements: list[str]        # top few, not all
+    key_conflicts: list[str]         # implication strings of severe conflicts
+    what_conflicts_imply: list[str]
+    reformulated_query: str | None
+    new_objective: str | None
+    converged: bool
+
+    @classmethod
+    def from_mediation(cls, m: "ImplyingNodes") -> "CompressedHistoryEntry":
+        return cls(
+            cycle=m.cycle,
+            dominant_conflict_type=(
+                m.conflict_type_summary.dominant_type
+                if m.conflict_type_summary else None
+            ),
+            agreement_count=len(m.agreements),
+            conflict_count=len(m.conflicts),
+            key_agreements=m.agreements[:3],
+            key_conflicts=[c.implication for c in m.conflicts if c.severity >= 3][:5],
+            what_conflicts_imply=m.what_conflicts_imply,
+            reformulated_query=m.wholeness.reformulated_query,
+            new_objective=m.wholeness.new_objective,
+            converged=m.converged,
+        )
+
+
 class SessionMemory(BaseModel):
     scenario_id: str
     main_cultural_frame: CulturalFrame
@@ -416,14 +765,33 @@ class SessionMemory(BaseModel):
         "demand they be justified rather than asserted, and refuse to let any "
         "single cultural norm stand in as a universal fact"
     )
-    # Working perspective for the challenger. Seeded from challenger_cultural_frame
-    # and updated each cycle from the mediation's implying nodes (which produce a
-    # free-text perspective, hence the str arm of the union).
-    active_challenger_perspective: CulturalFrame | None = None
+    # The mediator's own standpoint — named and auditable rather than implicit.
+    # A finding that reads as "neutral" is actually neutral only relative to this
+    # frame; surfacing it lets a reader judge whether it systematically advantages
+    # one party. Injected into the mediation prompt and stamped on the output doc.
+    mediator_frame: str = (
+        "procedural rationalist: prioritizes logical consistency, explicit "
+        "reasoning, and symmetrical treatment of both parties"
+    )
+    # Typed identities derived from the frames above (see derive_identities).
+    # These are the authoritative, IMMUTABLE source for prompt rendering — the
+    # loop never overwrites them, so a structured dimensional frame can no longer
+    # silently decay into free-text mediator prose across cycles.
+    main_identity: CulturalIdentity = Field(default_factory=CulturalIdentity)
+    challenger_identity: CulturalIdentity = Field(default_factory=CulturalIdentity)
+    # The mediator's evolving read on the challenger. Always prose, additive on top
+    # of challenger_identity — it refines how the challenger argues, never replaces
+    # who it is. Updated each cycle from wholeness.updated_challenger_perspective.
+    challenger_working_perspective: WorkingPerspective = Field(
+        default_factory=WorkingPerspective
+    )
     occurring: TheOccurring | None = None
     main_grids: list[NodeReasoningGrid] = []
     challenger_grids: list[NodeReasoningGrid] = []
     mediation_history: list[ImplyingNodes] = []
+    # Per-cycle distilled history for the mediator prompt. Appended once per
+    # cycle (incremental), so the prompt never re-flattens the full history.
+    compressed_history: list[CompressedHistoryEntry] = []
     # Two separate judge-score lists removes the fragile `judge_scores[-1]`
     # indexing that depended on graph ordering. Cycle judges score in-loop
     # mediations; output judges score the final generated document.
@@ -433,6 +801,10 @@ class SessionMemory(BaseModel):
     max_cycles: int = 3
     
     # Generation <-> evaluation regeneration loop controls.
+    # has_generated tracks whether generation has run at all (distinct from
+    # "is a regeneration"); regen_attempts counts judge-triggered regenerations
+    # and is incremented in the router that owns the decision, not in the node.
+    has_generated: bool = False
     max_regen: int = 1
     regen_attempts: int = 0
     output_score_threshold: int = 3
@@ -466,6 +838,21 @@ class SessionMemory(BaseModel):
     max_consecutive_failures: int = 5
     final_output: str | None = None
     converged: bool = False
+
+    @model_validator(mode="after")
+    def derive_identities(self) -> "SessionMemory":
+        """Convert the legacy CulturalFrame fields into typed CulturalIdentity once.
+
+        Only seeds an identity that hasn't been set explicitly, so the auto-detect
+        path (which assigns dimensional identities directly) is not clobbered.
+        """
+        if self.main_identity.is_neutral:
+            self.main_identity = CulturalIdentity.from_frame(self.main_cultural_frame)
+        if self.challenger_identity.is_neutral:
+            self.challenger_identity = CulturalIdentity.from_frame(
+                self.challenger_cultural_frame
+            )
+        return self
 
     @computed_field
     @property

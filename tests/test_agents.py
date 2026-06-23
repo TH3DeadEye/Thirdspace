@@ -20,6 +20,7 @@ from models import (
     NodeReasoningGrid,
     JudgeScore,
     FACET_LIST, DIMENSION_LIST, NUM_FACETS, NUM_CELLS,
+    CulturalIdentity, WorkingPerspective,
 )
 from tests.fixtures import (
     make_occurring, make_grid, make_mediation, make_wholeness,
@@ -115,7 +116,8 @@ class TestChallenger(unittest.TestCase):
         }
         grid = agents.run_challenger(
             occurring=make_occurring(),
-            challenger_frame="X",
+            challenger_identity=CulturalIdentity(label="X"),
+            challenger_working_perspective=WorkingPerspective(),
             cycle=0,
             challenger_style="procedural",
         )
@@ -157,8 +159,9 @@ class TestMediation(unittest.TestCase):
             occurring=make_occurring(),
             main_grid=make_grid("main", 0),
             challenger_grid=make_grid("challenger", 0),
-            all_mediation_history=[],
+            compressed_history=[],
             cycle=0,
+            mediator_frame="procedural rationalist",
         )
         self.assertEqual(med.cycle, 0)
         self.assertEqual(len(med.conflicts), 1)
@@ -181,12 +184,17 @@ class TestNodeUpdate(unittest.TestCase):
         agents.call_llm_json = stub
         occ = make_occurring()
         med = make_mediation(cycle=2)
-        updated = agents.run_node_update(occ, med)
-        stamps = {n.facet: n.last_updated_cycle for n in updated.nodes}
+        result = agents.run_node_update(occ, med)
+        stamps = {n.facet: n.last_updated_cycle for n in result.occurring.nodes}
         self.assertEqual(stamps["individuals"], 2)
         self.assertEqual(stamps["process"], 2)
         self.assertEqual(stamps["interactional_event"], 0)
         self.assertEqual(stamps["inferences"], 0)
+        # Measured delta agrees with the model's flag (no conflicts) and the two
+        # rewritten nodes are reported as actually changed.
+        changed = {d.facet for d in result.deltas if d.actually_changed}
+        self.assertEqual(changed, {"individuals", "process"})
+        self.assertEqual(result.conflicted_nodes, [])
 
     def test_no_signal_returns_same_object(self):
         from models import ImplyingNodes
@@ -200,7 +208,8 @@ class TestNodeUpdate(unittest.TestCase):
         empty_med.wholeness.query_assumptions = []
         occ = make_occurring()
         out = agents.run_node_update(occ, empty_med)
-        self.assertIs(out, occ)
+        self.assertIs(out.occurring, occ)
+        self.assertFalse(out.any_meaningful_change)
 
     def test_duplicate_facets_rejected(self):
         # Six nodes but two share the same facet — should fail set-equality check.
@@ -261,9 +270,15 @@ class TestConstrainedGeneration(unittest.TestCase):
         out = agents.run_constrained_generation(
             occurring=make_occurring(),
             mediation_history=[med0, med1],
+            mediator_frame="procedural rationalist test frame",
             evaluation_feedback="judge says fix tone",
         )
-        self.assertEqual(out, "DOC")
+        # Output is the LLM doc with an auditable mediator-frame metadata block
+        # deterministically prepended.
+        self.assertTrue(out.startswith("──"))
+        self.assertIn("ANALYSIS FRAME", out)
+        self.assertIn("procedural rationalist test frame", out)
+        self.assertTrue(out.rstrip().endswith("DOC"))
         self.assertIn("pattern-level finding", captured["user"])  # from cycle 0
         self.assertIn("second-cycle pattern", captured["user"])   # from cycle 1
         self.assertIn("judge says fix tone", captured["user"])    # feedback
@@ -287,6 +302,29 @@ class TestJudges(unittest.TestCase):
         }
         score = agents.run_cycle_judge(make_mediation(7), cycle=7)
         self.assertEqual(score.cycle, 7)
+
+
+class TestMediatorFrame(unittest.TestCase):
+    """The mediator's standpoint is named, injected into the mediation prompt,
+    and stamped on the output document for auditability."""
+
+    def test_session_memory_has_default_mediator_frame(self):
+        from models import SessionMemory
+        mem = SessionMemory(
+            scenario_id="m", main_cultural_frame="A", challenger_cultural_frame="B",
+        )
+        self.assertIn("procedural rationalist", mem.mediator_frame)
+
+    def test_build_mediation_system_injects_frame(self):
+        from utils.prompts import build_mediation_system
+        sys = build_mediation_system("procedural rationalist")
+        self.assertIn("procedural rationalist", sys)
+        self.assertIn("MEDIATOR FRAME", sys)
+        self.assertIn("NOT neutral", sys)
+
+    def test_build_mediation_system_omits_block_when_empty(self):
+        from utils.prompts import build_mediation_system
+        self.assertNotIn("MEDIATOR FRAME", build_mediation_system(""))
 
 
 if __name__ == "__main__":

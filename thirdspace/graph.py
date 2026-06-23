@@ -5,7 +5,9 @@ from langgraph.graph import StateGraph, END
 
 from metrics import convergence_similarity
 
-from models import SessionMemory
+from models import (
+    SessionMemory, CompressedHistoryEntry, WorkingPerspective, CulturalIdentity,
+)
 from agents import (
     run_frame_detection,
     run_reformulation,
@@ -42,9 +44,12 @@ def node_detect_frames(state: GraphState) -> GraphState:
     )
     mem.main_cultural_frame = detected.main
     mem.challenger_cultural_frame = detected.challenger
-    # Seed the working perspective from the detected challenger frame; the loop
-    # refines it (mirrors run_scenario's seeding for the explicit-frame path).
-    mem.active_challenger_perspective = detected.challenger
+    # Set the immutable structured identities directly from the detected axes.
+    # The challenger's identity stays fixed across cycles; only its working
+    # perspective (prose) evolves, so the structured frame never decays.
+    mem.main_identity = CulturalIdentity.from_frame(detected.main)
+    mem.challenger_identity = CulturalIdentity.from_frame(detected.challenger)
+    mem.challenger_working_perspective = WorkingPerspective()
     mem.frame_detection = detected
     return {"memory": mem}
 
@@ -81,14 +86,13 @@ def node_challenger(state: GraphState) -> GraphState:
     mem = state["memory"]
     cycle = mem.current_cycle
     logger.info(f"[{mem.scenario_id}] Phase 3: Challenger, cycle {cycle}")
-    # Use the working perspective if the loop has refined one; otherwise fall
-    # back to the original cultural frame.
-    challenger_frame = mem.active_challenger_perspective or mem.challenger_cultural_frame
-    # The challenger is fully isolated — it does not receive the main agent's grid
-    # or the main agent's frame, only The Occurring and its own frame.
+    # The challenger reasons from its fixed structured identity plus the mediator's
+    # evolving working perspective. It is otherwise isolated — it never receives the
+    # main agent's grid or frame, only The Occurring and its own frame.
     grid = run_challenger(
         occurring=mem.occurring,
-        challenger_frame=challenger_frame,
+        challenger_identity=mem.challenger_identity,
+        challenger_working_perspective=mem.challenger_working_perspective,
         cycle=cycle,
         challenger_style=mem.challenger_style,
     )
@@ -104,10 +108,14 @@ def node_mediation(state: GraphState) -> GraphState:
         occurring=mem.occurring,
         main_grid=mem.main_grids[-1],
         challenger_grid=mem.challenger_grids[-1],
-        all_mediation_history=mem.mediation_history,
+        compressed_history=mem.compressed_history,
         cycle=cycle,
+        mediator_frame=mem.mediator_frame,
     )
     mem.mediation_history.append(mediation)
+    # Distill this cycle once and append (O(1) per cycle); the mediator prompt
+    # reads this instead of re-flattening the whole history each call.
+    mem.compressed_history.append(CompressedHistoryEntry.from_mediation(mediation))
     mem.converged = mediation.converged
     mem.current_cycle += 1
     return {"memory": mem}
@@ -130,33 +138,56 @@ def node_integrate(state: GraphState) -> GraphState:
     logger.info(
         f"[{mem.scenario_id}] Integrate: folding implying nodes into The Occurring"
     )
-    mem.occurring = run_node_update(
-        occurring=mem.occurring,
-        mediation=mediation,
+    result = run_node_update(occurring=mem.occurring, mediation=mediation)
+    mem.occurring = result.occurring
+
+    changed = [d.facet for d in result.deltas if d.actually_changed]
+    conflicts = result.conflicted_nodes
+    logger.info(
+        f"[{mem.scenario_id}] Node update cycle {mediation.cycle}: "
+        f"changed={changed}, model_disagreements={conflicts}"
     )
-    updated_perspective = mediation.wholeness.updated_challenger_perspective
-    if updated_perspective:
-        mem.active_challenger_perspective = updated_perspective
+    if conflicts:
+        logger.warning(
+            f"[{mem.scenario_id}] Model's changed flag disagreed with content "
+            f"similarity on nodes: {conflicts}"
+        )
+
+    # Refine the challenger's WORKING PERSPECTIVE (prose) only when integration
+    # actually changed something. The structured identity is never overwritten.
+    if result.any_meaningful_change:
+        prose = mediation.wholeness.updated_challenger_perspective
+        if prose:
+            mem.challenger_working_perspective = WorkingPerspective(
+                cycle_last_updated=mediation.cycle, prose=prose
+            )
+            logger.info(
+                f"[{mem.scenario_id}] Updated challenger working perspective "
+                f"(identity preserved: {mem.challenger_identity.render()[:60]}...)"
+            )
     return {"memory": mem}
 
 
 def node_generate(state: GraphState) -> GraphState:
+    """Pure generation node — no counter mutation. has_generated distinguishes a
+    first run from a regeneration; the regen counter is owned by should_regenerate.
+    On a regeneration, feed back the last OUTPUT judge's reasoning (cycle judges
+    score mediations, not documents)."""
     mem = state["memory"]
     logger.info(f"[{mem.scenario_id}] Phase 5: Constrained generation")
-    # A non-None final_output means we already generated once, so this run is a
-    # regeneration: count the attempt and feed back the most recent OUTPUT
-    # judge's reasoning (not a cycle judge — those score mediations, not docs).
     feedback = None
-    if mem.final_output is not None:
-        mem.regen_attempts += 1
-        if mem.output_judge_scores:
-            feedback = mem.output_judge_scores[-1].reasoning
-    final_output = run_constrained_generation(
-        occurring=mem.occurring,
-        mediation_history=mem.mediation_history,
-        evaluation_feedback=feedback,
-    )
-    mem.final_output = final_output
+    if mem.has_generated and mem.output_judge_scores:
+        feedback = mem.output_judge_scores[-1].reasoning
+    try:
+        mem.final_output = run_constrained_generation(
+            occurring=mem.occurring,
+            mediation_history=mem.mediation_history,
+            mediator_frame=mem.mediator_frame,
+            evaluation_feedback=feedback,
+        )
+    finally:
+        # Mark attempted even on failure so a retry is treated as a regeneration.
+        mem.has_generated = True
     return {"memory": mem}
 
 
@@ -247,20 +278,26 @@ def should_continue_after_judge(state: GraphState) -> str:
 
 
 def should_regenerate(state: GraphState) -> str:
-    # Pure router: decide only, do not mutate state. The attempt counter is
-    # bumped inside node_generate when it actually regenerates.
+    # The router owns the regeneration decision AND its counter — a node should
+    # not increment a counter that tracks a router's decision.
     mem = state["memory"]
     score = mem.output_judge_scores[-1]
     threshold = mem.output_score_threshold
     below = score.empathy < threshold or score.cultural_insight < threshold
     if below and mem.regen_attempts < mem.max_regen:
+        mem.regen_attempts += 1
         logger.info(
             f"[{mem.scenario_id}] Output below threshold "
             f"(empathy={score.empathy}, insight={score.cultural_insight}); "
-            f"regenerating"
+            f"regenerating (attempt {mem.regen_attempts}/{mem.max_regen})"
         )
         return "generate"
-    logger.info(f"[{mem.scenario_id}] Output accepted")
+    if below:
+        logger.warning(
+            f"[{mem.scenario_id}] Output below threshold but max_regen="
+            f"{mem.max_regen} exhausted; accepting subthreshold output."
+        )
+    logger.info(f"[{mem.scenario_id}] Output accepted after {mem.regen_attempts} regen(s)")
     return "end"
 
 

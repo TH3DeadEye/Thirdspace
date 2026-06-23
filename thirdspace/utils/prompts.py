@@ -273,7 +273,7 @@ def critical_thinking_cell_user(
     occurring_json: str,
     facet: str,
     dimension: str,
-    prior_findings: str | None = None,
+    prior_context_json: str | None = None,
 ) -> str:
     base = f"""\
 Reason about this specific node and dimension.
@@ -286,11 +286,22 @@ THE OCCURRING:
 
 Focus only on the {facet} node as seen through the {dimension} lens.
 """
-    if prior_findings:
-        base += (
-            "\nPRIOR CYCLE REFINEMENTS — advance beyond previous reasoning:\n"
-            f"{prior_findings}\n"
-        )
+    if prior_context_json:
+        base += f"""
+<prior_cycle_guidance>
+{prior_context_json}
+</prior_cycle_guidance>
+
+The block above is structured JSON from the previous cycle's mediator. Reason by
+field name, not position:
+- reformulated_query: how the analytical question has been refined
+- new_objective: what the analysis should now be oriented toward
+- query_assumptions / objective_assumptions: assumptions to hold about the
+  question and the objective
+- updated_assumptions: node-level corrections the mediation produced
+
+Reason from within this refined frame. Do not merely restate these fields.
+"""
     return base
 
 
@@ -410,10 +421,10 @@ solely from your own standpoint.
 # Phase 4 — Mediation prompts
 # ---------------------------------------------------------------------------
 
-MEDIATION_SYSTEM = """\
+_MEDIATION_SYSTEM_BODY = """\
 You are the mediation engine in a cultural conflict analysis system.
 
-For each cell pair: AGREEMENT or CONFLICT.
+{frame_block}For each cell pair: AGREEMENT or CONFLICT.
 
 For CONFLICT — complete all five sub-tasks:
 
@@ -475,7 +486,21 @@ conflicts appeared.
 Respond ONLY with valid JSON. No preamble. No markdown fences.
 """
 
-MEDIATION_SYSTEM = decorate(MEDIATION_SYSTEM, BLIND_SPOTS)
+def build_mediation_system(mediator_frame: str) -> str:
+    """Mediation system prompt with the mediator's own frame made explicit.
+
+    The mediator is not a neutral observer — it reasons from a standpoint. Naming
+    that standpoint in the prompt (and stamping it on the output) lets a reader
+    judge whether a "neutral" finding is actually neutral or quietly frame-biased.
+    An empty frame omits the block (back-compat / neutral mode).
+    """
+    frame_block = (
+        f"YOUR MEDIATOR FRAME (the standpoint you mediate from): {mediator_frame}\n"
+        "This frame is NOT neutral. Where it could systematically advantage one "
+        "party, say so explicitly rather than presenting the finding as neutral.\n\n"
+    ) if mediator_frame else ""
+    base = _MEDIATION_SYSTEM_BODY.replace("{frame_block}", frame_block)
+    return decorate(base, BLIND_SPOTS)
 
 def mediation_user(
     occurring_json: str,

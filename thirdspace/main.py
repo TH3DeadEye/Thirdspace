@@ -58,6 +58,7 @@ def run_scenario(
     challenger_cultural_frame: CulturalFrame | None = None,
     max_cycles: int = 3,
     challenger_style: str | None = None,
+    mediator_frame: str | None = None,
     output_dir: Path | None = DEFAULT_OUTPUT_DIR,
 ) -> SessionMemory:
     # Frame mode is inferred from what the caller passed:
@@ -79,11 +80,12 @@ def run_scenario(
     fields = {
         "scenario_id": scenario_id,
         # In auto mode these start as placeholders; node_detect_frames overwrites
-        # them (and seeds active_challenger_perspective) before reformulation.
+        # them and sets the structured identities before reformulation. In the
+        # explicit/neutral path, SessionMemory.derive_identities builds the typed
+        # CulturalIdentity from these frames; the challenger working perspective
+        # starts empty (prose=None) and the loop refines it without touching identity.
         "main_cultural_frame": "" if auto else main_cultural_frame,
         "challenger_cultural_frame": "" if auto else challenger_cultural_frame,
-        # Seed the working perspective from the cultural frame; the loop refines it.
-        "active_challenger_perspective": "" if auto else challenger_cultural_frame,
         "auto_detect_frames": auto,
         "occurring": TheOccurring(
             scenario_id=scenario_id,
@@ -94,6 +96,8 @@ def run_scenario(
     }
     if challenger_style is not None:
         fields["challenger_style"] = challenger_style
+    if mediator_frame is not None:
+        fields["mediator_frame"] = mediator_frame
     memory = SessionMemory(**fields)
     graph = build_graph()
     # Register the active memory so call_llm can accumulate budget / latency
