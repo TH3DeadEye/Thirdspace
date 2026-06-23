@@ -31,6 +31,72 @@ def render_frame(frame) -> str:
     return "; ".join(parts)
 
 # ---------------------------------------------------------------------------
+# Phase 0 — Cultural frame detection prompts
+# ---------------------------------------------------------------------------
+
+def render_dimension_menu(menu: dict[str, tuple[str, str]]) -> str:
+    """Format the bounded dimension menu for the detection prompt as
+    `dimension: value_a | value_b` lines, so the model picks only from it."""
+    return "\n".join(f"- {dim}: {a} | {b}" for dim, (a, b) in menu.items())
+
+
+FRAME_DETECTION_SYSTEM = """\
+You are a cultural frame detector. A user has described a conflict between two
+parties. Your job is to infer the cultural standpoint of EACH party as a set of
+dimensional axes, so a downstream reasoning system can analyze the conflict from
+both frames.
+
+YOU MUST PICK FROM A FIXED MENU.
+You are given a closed list of dimensions, each with exactly two allowed values.
+- Do NOT invent dimension names. Use only the dimension keys from the menu.
+- Do NOT invent values. Each axis value must be one of that dimension's two
+  allowed values, verbatim.
+
+WHAT TO SELECT:
+- Identify the two parties in the scenario (call them "main" and "challenger").
+  "main" is the narrator / the party whose perspective the scenario is told from.
+- For each party, choose 4 to 6 dimensions FROM THE MENU — specifically the ones
+  where the two parties most differ, because that is where the conflict lives.
+- Assign CONTRASTING values: the dimensions you choose should be ones where main
+  and challenger land on opposite values. Do not make the two frames identical;
+  if they were identical there would be no cultural conflict to analyze.
+- Use the same set of dimensions for both parties so they can be compared
+  axis-for-axis.
+
+Base your inference on what the scenario actually shows — the behaviors,
+reactions, and friction described — not on national stereotypes.
+
+Respond ONLY with valid JSON. No preamble. No markdown fences.
+"""
+
+
+def frame_detection_user(raw_scenario: str, menu_str: str) -> str:
+    return f"""\
+Detect the cultural frame of each party in this scenario.
+
+RAW SCENARIO:
+{raw_scenario}
+
+DIMENSION MENU (pick only these dimensions; each value must be one of the two shown):
+{menu_str}
+
+Return this exact JSON:
+{{
+  "main": [
+    {{"dimension": "<menu dimension>", "value": "<one of its two allowed values>"}}
+  ],
+  "challenger": [
+    {{"dimension": "<menu dimension>", "value": "<one of its two allowed values>"}}
+  ],
+  "rationale": "<2-4 sentences: which behaviors in the scenario imply these axes, and why the two frames contrast>"
+}}
+
+Choose 4 to 6 dimensions where the two parties most differ, assign contrasting
+values, and use the same dimensions for both parties.
+"""
+
+
+# ---------------------------------------------------------------------------
 # Phase 1 — Reformulation prompts
 # ---------------------------------------------------------------------------
 
@@ -207,7 +273,7 @@ def critical_thinking_cell_user(
     occurring_json: str,
     facet: str,
     dimension: str,
-    prior_findings: str | None = None,
+    prior_context_json: str | None = None,
 ) -> str:
     base = f"""\
 Reason about this specific node and dimension.
@@ -220,11 +286,22 @@ THE OCCURRING:
 
 Focus only on the {facet} node as seen through the {dimension} lens.
 """
-    if prior_findings:
-        base += (
-            "\nPRIOR CYCLE REFINEMENTS — advance beyond previous reasoning:\n"
-            f"{prior_findings}\n"
-        )
+    if prior_context_json:
+        base += f"""
+<prior_cycle_guidance>
+{prior_context_json}
+</prior_cycle_guidance>
+
+The block above is structured JSON from the previous cycle's mediator. Reason by
+field name, not position:
+- reformulated_query: how the analytical question has been refined
+- new_objective: what the analysis should now be oriented toward
+- query_assumptions / objective_assumptions: assumptions to hold about the
+  question and the objective
+- updated_assumptions: node-level corrections the mediation produced
+
+Reason from within this refined frame. Do not merely restate these fields.
+"""
     return base
 
 
@@ -234,24 +311,24 @@ Focus only on the {facet} node as seen through the {dimension} lens.
 
 def challenger_cell_system(
     challenger_frame: str,
-    main_frame: str,
     challenger_style: str,
     facet: str,
     dimension: str,
 ) -> str:
+    # The challenger is fully blind: it never learns the main agent's frame, grid,
+    # or any other agent's reasoning. It reasons from its own frame (or as a neutral
+    # second analyst) and mediation later compares the two independent grids.
+    #
     # Empty challenger_frame => neutral mode: the challenger stays an independent
     # second analyst that surfaces the strongest ALTERNATIVE reading, but without a
     # designated cultural stance (and without the "name your frame" lines).
     if challenger_frame:
-        identity_lines = [f"YOUR CULTURAL FRAME: {challenger_frame}"]
-        if main_frame:
-            identity_lines.append(f"THE CONTRASTING FRAME IN THIS SCENARIO: {main_frame}")
-        identity_block = "\n".join(identity_lines)
+        identity_block = f"YOUR CULTURAL FRAME: {challenger_frame}"
         independent_voice = (
             "You do NOT see and do NOT respond to any other agent's reasoning. Reason about\n"
             f"this cell entirely from within {challenger_frame}, building the strongest reading\n"
             "the cell supports from your frame alone. A separate mediation step will later\n"
-            "compare your reasoning against the other frame — that is not your job here."
+            "compare your reasoning against another frame — that is not your job here."
         )
         naming_block = (
             f"Whenever {challenger_frame} shapes your reasoning, name it. Do not let\n"
@@ -273,18 +350,11 @@ def challenger_cell_system(
         )
         consistency = ""
 
-    if main_frame:
-        most_important_move = (
-            f"Name any place where a {main_frame}-style norm would be mistaken for a universal\n"
-            "human fact, and state how the same moment reads differently from your standpoint.\n"
-            "Do this from your own standpoint — not by reacting to another agent."
-        )
-    else:
-        most_important_move = (
-            "Name any place where one party's norm would be mistaken for a universal human\n"
-            "fact, and articulate the strongest alternative reading of the same moment.\n"
-            "Do this from your own standpoint — not by reacting to another agent."
-        )
+    most_important_move = (
+        "Name any place where one party's norm would be mistaken for a universal human\n"
+        "fact, and articulate the strongest alternative reading of the same moment.\n"
+        "Do this from your own standpoint — not by reacting to another agent."
+    )
 
     base = f"""\
 You are the Challenger agent in a cultural conflict analysis system.
@@ -351,10 +421,10 @@ solely from your own standpoint.
 # Phase 4 — Mediation prompts
 # ---------------------------------------------------------------------------
 
-MEDIATION_SYSTEM = """\
+_MEDIATION_SYSTEM_BODY = """\
 You are the mediation engine in a cultural conflict analysis system.
 
-For each cell pair: AGREEMENT or CONFLICT.
+{frame_block}For each cell pair: AGREEMENT or CONFLICT.
 
 For CONFLICT — complete all five sub-tasks:
 
@@ -416,7 +486,21 @@ conflicts appeared.
 Respond ONLY with valid JSON. No preamble. No markdown fences.
 """
 
-MEDIATION_SYSTEM = decorate(MEDIATION_SYSTEM, BLIND_SPOTS)
+def build_mediation_system(mediator_frame: str) -> str:
+    """Mediation system prompt with the mediator's own frame made explicit.
+
+    The mediator is not a neutral observer — it reasons from a standpoint. Naming
+    that standpoint in the prompt (and stamping it on the output) lets a reader
+    judge whether a "neutral" finding is actually neutral or quietly frame-biased.
+    An empty frame omits the block (back-compat / neutral mode).
+    """
+    frame_block = (
+        f"YOUR MEDIATOR FRAME (the standpoint you mediate from): {mediator_frame}\n"
+        "This frame is NOT neutral. Where it could systematically advantage one "
+        "party, say so explicitly rather than presenting the finding as neutral.\n\n"
+    ) if mediator_frame else ""
+    base = _MEDIATION_SYSTEM_BODY.replace("{frame_block}", frame_block)
+    return decorate(base, BLIND_SPOTS)
 
 def mediation_user(
     occurring_json: str,

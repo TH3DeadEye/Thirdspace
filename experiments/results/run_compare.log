@@ -1,0 +1,38 @@
+2026-06-18 14:45:28,277 [INFO] [llama-3.1-8b] single_shot run 1/2
+2026-06-18 14:45:52,868 [INFO] [llama-3.1-8b] single_shot run 2/2
+2026-06-18 14:46:13,564 [INFO] [llama-3.1-8b] self_opp_mediate run 1/2
+2026-06-18 14:46:35,522 [INFO] [llama-3.1-8b] self_opp_mediate run 2/2
+2026-06-18 14:46:56,363 [INFO] [haiku-4.5] single_shot run 1/2
+2026-06-18 14:47:22,429 [INFO] [haiku-4.5] single_shot run 2/2
+2026-06-18 14:47:48,971 [INFO] [haiku-4.5] self_opp_mediate run 1/2
+2026-06-18 14:48:50,117 [INFO] [haiku-4.5] self_opp_mediate run 2/2
+2026-06-18 14:49:39,792 [INFO] [sonnet-4.5] single_shot run 1/2
+2026-06-18 14:50:20,559 [INFO] [sonnet-4.5] single_shot run 2/2
+2026-06-18 14:50:57,568 [INFO] [sonnet-4.5] self_opp_mediate run 1/2
+2026-06-18 14:52:44,835 [ERROR] [sonnet-4.5] self_opp_mediate run 1 FAILED: Judge did not return JSON. Raw:
+```json
+{
+  "reasoning": "Working through each dimension systematically:
+
+EMPATHY: The document reconstructs both experiences with remarkable granularity. For the German student: 'anxiety about being seen as a freeloader,' 'pride in having added extra money,' 'bewilderment and hurt' at the outcome. For Karim: 'pride and pleasure in hosting,' 'a sinking feeling as he understood what it meant,' 'disappointment' not anger, the distance as 'acceptance' rather than punishment. Crucially, it avoids blame ('Neither person was trying to offend') while showing how each person's respectful behavior became hurtful to the other. It doesn't create false balance—it shows asymmetric experiences that are both valid. The phrase 'Both people are hurt and confused' captures mutual pain without equivalencing 
+2026-06-18 14:52:44,836 [INFO] [sonnet-4.5] self_opp_mediate run 2/2
+2026-06-18 14:54:27,836 [INFO] [thirdspace] judging run 1/2
+2026-06-18 14:54:53,691 [INFO] [thirdspace] judging run 2/2
+2026-06-18 14:55:12,748 [INFO] Saved raw outputs + scores to C:\Users\arman\Desktop\Programming\ThirdSpace\experiments\results\baseline_20260618T185512Z.json
+2026-06-18 14:55:12,748 [INFO] ThirdSpace avg total: 25/25
+
+==============================================================================
+RESULTS  (avg of 2 run(s), judge=blind, opponent=debate)
+==============================================================================
+model           condition             empat  conse  escal  cultu  inter   TOTAL
+-------------------------------------------------------------------------------
+llama-3.1-8b    single_shot             2.5      2      2    2.5    1.5    10.5
+llama-3.1-8b    self_opp_mediate          3      3      2    3.5    2.5    14.0
+haiku-4.5       single_shot               5      5      3      5      5      23
+haiku-4.5       self_opp_mediate          5      5      5      5      5      25
+sonnet-4.5      single_shot               5      5    3.5      5      5    23.5
+sonnet-4.5      self_opp_mediate          5      5      4      5      5      24
+thirdspace      pipeline                  5      5      5      5      5      25
+-------------------------------------------------------------------------------
+Headline metric: TOTAL out of 25. Compare each model's self_opp_mediate to
+its single_shot, and the whole table to the ThirdSpace row.

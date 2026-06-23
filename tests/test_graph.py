@@ -14,8 +14,29 @@ for p in (_ROOT, _ROOT / "thirdspace"):
 
 import graph as g
 import metrics
-from models import SessionMemory, JudgeScore, ImplyingNodes
+from models import (
+    SessionMemory, JudgeScore, ImplyingNodes, DetectedFrames, CultureAxis,
+    TheOccurringUpdateResult, NodeUpdateDelta,
+)
 from tests.fixtures import make_occurring, make_grid, make_mediation, make_wholeness
+
+
+def _stub_node_update(occurring, mediation):
+    """Stand-in for run_node_update returning the new TheOccurringUpdateResult.
+
+    Marks every node as actually changed so node_integrate exercises the
+    working-perspective update path.
+    """
+    occ = make_occurring("updated")
+    deltas = [
+        NodeUpdateDelta(
+            facet=n.facet, similarity=0.0, model_claimed_changed=True,
+            actually_changed=True, content_kept=n.content,
+            content_proposed=n.content, conflict=False,
+        )
+        for n in occ.nodes
+    ]
+    return TheOccurringUpdateResult(occurring=occ, deltas=deltas)
 
 
 def _char_embed(text):
@@ -27,6 +48,13 @@ def _char_embed(text):
 
 def _install_stubs(g_module, *, low_score: bool = False, max_loop_cycles: int = 2):
     """Replace every agent function bound in graph.py's namespace with a stub."""
+    # Only exercised when auto_detect_frames=True (passthrough otherwise), but
+    # bound here so the auto-detect test has a deterministic detector.
+    g_module.run_frame_detection = lambda raw_scenario, scenario_id: DetectedFrames(
+        main=[CultureAxis(dimension="power_distance", value="low")],
+        challenger=[CultureAxis(dimension="power_distance", value="high")],
+        rationale="stub detection",
+    )
     g_module.run_reformulation = lambda raw_scenario, scenario_id: make_occurring(scenario_id)
     g_module.run_critical_thinking = lambda occurring, cultural_frame, cycle, prior_mediation=None: make_grid("main", cycle)
     g_module.run_challenger = lambda **kw: make_grid("challenger", kw["cycle"])
@@ -35,7 +63,7 @@ def _install_stubs(g_module, *, low_score: bool = False, max_loop_cycles: int = 
         # Force convergence on the last allowed cycle so the loop terminates.
         converged=(kw["cycle"] >= max_loop_cycles - 1),
     )
-    g_module.run_node_update = lambda occurring, mediation: make_occurring("updated")
+    g_module.run_node_update = _stub_node_update
     g_module.run_cycle_judge = lambda mediation, cycle: JudgeScore(
         cycle=cycle, empathy=5, consensus=5, escalation_risk=2,
         cultural_insight=5, intervention_fidelity=5, reasoning="cycle ok",
@@ -48,7 +76,7 @@ def _install_stubs(g_module, *, low_score: bool = False, max_loop_cycles: int = 
         reasoning="output judge reasoning",
     )
     g_module.run_constrained_generation = (
-        lambda occurring, mediation_history, evaluation_feedback=None:
+        lambda occurring, mediation_history, mediator_frame=None, evaluation_feedback=None:
             f"DOC(feedback={evaluation_feedback!r})"
     )
 
@@ -58,7 +86,6 @@ def _mem(max_cycles: int = 2) -> SessionMemory:
         scenario_id="t1",
         main_cultural_frame="A",
         challenger_cultural_frame="B",
-        active_challenger_perspective="B",
         occurring=make_occurring("t1"),
         max_cycles=max_cycles,
         # These orchestration tests exercise routing, not the metric. Pin to
@@ -167,7 +194,7 @@ class TestConsensusPlateau(unittest.TestCase):
         g_module.run_critical_thinking = lambda occurring, cultural_frame, cycle, prior_mediation=None: make_grid("main", cycle)
         g_module.run_challenger = lambda **kw: make_grid("challenger", kw["cycle"])
         g_module.run_mediation = lambda **kw: make_mediation(cycle=kw["cycle"], converged=False)
-        g_module.run_node_update = lambda occurring, mediation: make_occurring("updated")
+        g_module.run_node_update = _stub_node_update
         # Cycle judge: always returns consensus=5 so two in a row trigger plateau.
         g_module.run_cycle_judge = lambda mediation, cycle: JudgeScore(
             cycle=cycle, empathy=5, consensus=5, escalation_risk=2,
@@ -178,7 +205,7 @@ class TestConsensusPlateau(unittest.TestCase):
             cultural_insight=5, intervention_fidelity=5, reasoning="output judge reasoning",
         )
         g_module.run_constrained_generation = (
-            lambda occurring, mediation_history, evaluation_feedback=None: "DOC"
+            lambda occurring, mediation_history, mediator_frame=None, evaluation_feedback=None: "DOC"
         )
 
     def test_plateau_triggers_termination_before_max_cycles(self):
@@ -236,13 +263,13 @@ class TestEmbeddingConvergence(unittest.TestCase):
             cycle=cycle, empathy=5, consensus=2, escalation_risk=2,
             cultural_insight=5, intervention_fidelity=5, reasoning="cycle ok",
         )
-        g_module.run_node_update = lambda occurring, mediation: make_occurring("updated")
+        g_module.run_node_update = _stub_node_update
         g_module.run_judge = lambda final_output, mediation_history, cycle: JudgeScore(
             cycle=cycle, empathy=5, consensus=5, escalation_risk=2,
             cultural_insight=5, intervention_fidelity=5, reasoning="output judge",
         )
         g_module.run_constrained_generation = (
-            lambda occurring, mediation_history, evaluation_feedback=None: "DOC"
+            lambda occurring, mediation_history, mediator_frame=None, evaluation_feedback=None: "DOC"
         )
 
     def test_low_embedding_similarity_overrides_premature_convergence(self):
@@ -253,7 +280,7 @@ class TestEmbeddingConvergence(unittest.TestCase):
             compiled = g.build_graph()
             mem = SessionMemory(
                 scenario_id="emb", main_cultural_frame="A",
-                challenger_cultural_frame="B", active_challenger_perspective="B",
+                challenger_cultural_frame="B",
                 occurring=make_occurring("emb"), max_cycles=3,
                 convergence_metric="embedding",
             )
@@ -265,6 +292,81 @@ class TestEmbeddingConvergence(unittest.TestCase):
         # (Under jaccard, empty conflict sets would have stopped it at cycle 1.)
         self.assertEqual(len(out.mediation_history), 3)
         self.assertEqual(out.final_output, "DOC")
+
+
+class TestAutoDetectFrames(unittest.TestCase):
+    """Phase 0 entry node fills both frames from the scenario when
+    auto_detect_frames=True, and is a passthrough otherwise."""
+
+    def test_detected_frames_populate_before_pipeline(self):
+        _install_stubs(g, low_score=False, max_loop_cycles=1)
+        compiled = g.build_graph()
+        mem = SessionMemory(
+            scenario_id="auto",
+            main_cultural_frame="", challenger_cultural_frame="",
+            occurring=make_occurring("auto"),
+            max_cycles=1, convergence_metric="jaccard",
+            auto_detect_frames=True,
+        )
+        out = compiled.invoke({"memory": mem})["memory"]
+        # Detection ran: placeholder frames were overwritten and recorded.
+        self.assertIsNotNone(out.frame_detection)
+        self.assertEqual([a.dimension for a in out.main_cultural_frame], ["power_distance"])
+        self.assertEqual(out.main_cultural_frame[0].value, "low")
+        self.assertEqual(out.challenger_cultural_frame[0].value, "high")
+        # challenger_identity set (structured) from the detected challenger frame.
+        self.assertEqual(out.challenger_identity.axes[0].value, "high")
+
+    def test_passthrough_leaves_explicit_frames_untouched(self):
+        _install_stubs(g, low_score=False, max_loop_cycles=1)
+        compiled = g.build_graph()
+        mem = SessionMemory(
+            scenario_id="explicit",
+            main_cultural_frame="Frame A", challenger_cultural_frame="Frame B",
+            occurring=make_occurring("explicit"),
+            max_cycles=1, convergence_metric="jaccard",
+            # auto_detect_frames defaults False -> node is a no-op.
+        )
+        out = compiled.invoke({"memory": mem})["memory"]
+        self.assertIsNone(out.frame_detection)
+        self.assertEqual(out.main_cultural_frame, "Frame A")
+        self.assertEqual(out.challenger_cultural_frame, "Frame B")
+
+
+class TestMediatorFrameWiring(unittest.TestCase):
+    """node_mediation and node_generate must thread mem.mediator_frame into the
+    mediation and constrained-generation calls."""
+
+    def test_mediator_frame_reaches_both_agent_calls(self):
+        _install_stubs(g, low_score=False, max_loop_cycles=1)
+        captured = {}
+        base_med = g.run_mediation
+        base_gen = g.run_constrained_generation
+
+        def cap_med(**kw):
+            captured["mediation"] = kw.get("mediator_frame")
+            return base_med(**kw)
+
+        def cap_gen(occurring, mediation_history, mediator_frame=None, evaluation_feedback=None):
+            captured["generation"] = mediator_frame
+            return base_gen(
+                occurring=occurring, mediation_history=mediation_history,
+                mediator_frame=mediator_frame, evaluation_feedback=evaluation_feedback,
+            )
+
+        g.run_mediation = cap_med
+        g.run_constrained_generation = cap_gen
+        try:
+            compiled = g.build_graph()
+            mem = _mem(max_cycles=1)
+            mem.mediator_frame = "utilitarian arbiter"
+            compiled.invoke({"memory": mem})
+        finally:
+            g.run_mediation = base_med
+            g.run_constrained_generation = base_gen
+
+        self.assertEqual(captured["mediation"], "utilitarian arbiter")
+        self.assertEqual(captured["generation"], "utilitarian arbiter")
 
 
 if __name__ == "__main__":

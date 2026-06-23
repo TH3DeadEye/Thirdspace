@@ -20,11 +20,21 @@ directly), the counters and breaker are no-ops.
 from __future__ import annotations
 
 import contextvars
+import logging
+import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from models import SessionMemory
+
+logger = logging.getLogger(__name__)
+
+# One lock per process, held only around the integer counter mutations in
+# record_success / record_failure (never across an LLM call), so contention is
+# microseconds. Fixes the read-modify-write race on `mem.llm_calls_made += 1`
+# under the cell-level ThreadPoolExecutor.
+_counter_lock = threading.Lock()
 
 
 class BudgetExceeded(RuntimeError):
@@ -82,9 +92,20 @@ def record_success(latency_ms: int) -> None:
     mem = _active_memory.get()
     if mem is None:
         return
-    mem.llm_calls_made += 1
-    mem.total_latency_ms += latency_ms
-    mem.consecutive_failures = 0
+    with _counter_lock:
+        mem.llm_calls_made += 1
+        mem.total_latency_ms += latency_ms
+        mem.consecutive_failures = 0
+        # Post-increment guard: check_budget_before_call is intentionally
+        # lock-free (locking 84 cell calls through one chokepoint would kill the
+        # parallelism), so one call can slip past a nearly-exhausted budget.
+        # Catch and log that here rather than preventing it there.
+        if mem.llm_calls_made > mem.llm_call_budget:
+            logger.warning(
+                f"[{mem.scenario_id}] Budget exceeded post-call: "
+                f"{mem.llm_calls_made} > {mem.llm_call_budget}. "
+                f"A race allowed one extra call through."
+            )
 
 
 def record_failure() -> None:
@@ -95,11 +116,15 @@ def record_failure() -> None:
     mem = _active_memory.get()
     if mem is None:
         return
-    mem.consecutive_failures += 1
-    if mem.consecutive_failures > mem.max_consecutive_failures:
+    with _counter_lock:
+        mem.consecutive_failures += 1
+        over_limit = mem.consecutive_failures > mem.max_consecutive_failures
+        failures = mem.consecutive_failures
+    # Raise outside the lock — never raise while holding it.
+    if over_limit:
         raise CircuitOpen(
             f"Scenario {mem.scenario_id} circuit open: "
-            f"{mem.consecutive_failures} consecutive failures "
+            f"{failures} consecutive failures "
             f"(> {mem.max_consecutive_failures})"
         )
 
@@ -112,11 +137,9 @@ def active_memory(memory: "SessionMemory | None"):
     same SessionMemory the main thread registered. If `memory` is None the
     context manager is a no-op (supports tests that don't register a memory).
 
-    Concurrency note: under CPython the GIL makes most attribute reads atomic,
-    but `mem.llm_calls_made += 1` is a read-modify-write and could miss a
-    handful of increments under high parallelism. For the 42-cells-per-cycle
-    workload this is acceptable; if exact counts become important, add a lock
-    around `record_success` / `record_failure`.
+    Concurrency note: `mem.llm_calls_made += 1` is a read-modify-write that
+    could otherwise miss increments under high parallelism, so record_success /
+    record_failure now mutate the counters under `_counter_lock`.
     """
     if memory is None:
         yield

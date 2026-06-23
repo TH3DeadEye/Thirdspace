@@ -20,13 +20,13 @@ logger = logging.getLogger(__name__)
 #main agent LLM model 
 BEDROCK_MODEL_ID = os.environ.get(
     "BEDROCK_MODEL_ID",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    
 )
 
 #challenger agent LLM model (it should be different from main)
 CHALLENGER_MODEL_ID = os.environ.get(
     "CHALLENGER_MODEL_ID",
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    
 )
 
 #judge agent LLM model

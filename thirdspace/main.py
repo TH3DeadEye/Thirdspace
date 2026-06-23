@@ -29,41 +29,64 @@ def persist_session(memory: SessionMemory, output_dir: Path = DEFAULT_OUTPUT_DIR
     # Atomic write: write a temp file in the same dir, then os.replace (atomic
     # on POSIX). A crash mid-write leaves the old file intact, never a partial.
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(memory.model_dump_json(indent=2))
+    # Force UTF-8: the session JSON contains non-ASCII characters (e.g. the "→"
+    # in mediation assumption updates, "…" from truncation). Path.write_text
+    # defaults to the OS locale codec, which is cp1252 on Windows and raises
+    # UnicodeEncodeError on those characters.
+    tmp.write_text(memory.model_dump_json(indent=2), encoding="utf-8")
     os.replace(tmp, path)
     return path
 
 
 def _make_scenario_id(
     raw_scenario: str,
-    main_frame: CulturalFrame,
-    challenger_frame: CulturalFrame,
+    main_frame: CulturalFrame | None,
+    challenger_frame: CulturalFrame | None,
 ) -> str:
     """Deterministic 12-char id from the inputs, so re-running the same scenario
     writes to the same output file (reproducible; no orphaned partial runs).
     Frames are rendered first so a dimensional frame and its string form produce
-    stable, comparable ids."""
+    stable, comparable ids. In auto-detect mode (both frames None) the frames
+    aren't known yet, so the id hashes the raw scenario alone."""
     content = f"{raw_scenario}|{render_frame(main_frame)}|{render_frame(challenger_frame)}"
     return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 
 def run_scenario(
     raw_scenario: str,
-    main_cultural_frame: CulturalFrame,
-    challenger_cultural_frame: CulturalFrame,
+    main_cultural_frame: CulturalFrame | None = None,
+    challenger_cultural_frame: CulturalFrame | None = None,
     max_cycles: int = 3,
     challenger_style: str | None = None,
+    mediator_frame: str | None = None,
     output_dir: Path | None = DEFAULT_OUTPUT_DIR,
 ) -> SessionMemory:
+    # Frame mode is inferred from what the caller passed:
+    #   both None -> auto-detect (production: user submits only a scenario)
+    #   "" / []   -> neutral (deliberate no-frame baseline)
+    #   otherwise -> explicit (use the given frames as-is)
+    # "" and None are distinct signals: "" means "run with no frame", None means
+    # "decide the frame for me". A lone None coerces to "" (neutral for that side).
+    auto = main_cultural_frame is None and challenger_cultural_frame is None
+    if not auto:
+        main_cultural_frame = "" if main_cultural_frame is None else main_cultural_frame
+        challenger_cultural_frame = (
+            "" if challenger_cultural_frame is None else challenger_cultural_frame
+        )
+
     scenario_id = _make_scenario_id(
         raw_scenario, main_cultural_frame, challenger_cultural_frame
     )
     fields = {
         "scenario_id": scenario_id,
-        "main_cultural_frame": main_cultural_frame,
-        "challenger_cultural_frame": challenger_cultural_frame,
-        # Seed the working perspective from the cultural frame; the loop refines it.
-        "active_challenger_perspective": challenger_cultural_frame,
+        # In auto mode these start as placeholders; node_detect_frames overwrites
+        # them and sets the structured identities before reformulation. In the
+        # explicit/neutral path, SessionMemory.derive_identities builds the typed
+        # CulturalIdentity from these frames; the challenger working perspective
+        # starts empty (prose=None) and the loop refines it without touching identity.
+        "main_cultural_frame": "" if auto else main_cultural_frame,
+        "challenger_cultural_frame": "" if auto else challenger_cultural_frame,
+        "auto_detect_frames": auto,
         "occurring": TheOccurring(
             scenario_id=scenario_id,
             raw_scenario=raw_scenario,
@@ -73,6 +96,8 @@ def run_scenario(
     }
     if challenger_style is not None:
         fields["challenger_style"] = challenger_style
+    if mediator_frame is not None:
+        fields["mediator_frame"] = mediator_frame
     memory = SessionMemory(**fields)
     graph = build_graph()
     # Register the active memory so call_llm can accumulate budget / latency
@@ -106,41 +131,50 @@ def run_scenario(
 
 if __name__ == "__main__":
     scenario = """
-    I'm a Canadian working at a tech company. My new colleague is from Iran.
-    Last week I gave him feedback on his code in our team meeting — I pointed
-    out some inefficiencies directly in front of everyone, the way I always do
-    with the team. He went completely silent, didn't respond, and has barely
-    spoken to me since. My manager told me he seems upset but won't say why.
-    I don't understand what I did wrong — I was just being honest and direct.
+I'm a German PhD student in Toronto. A few weeks ago a colleague in my lab, Karim,
+who moved here from Jordan, invited me and three other students to his apartment for
+dinner. He cooked for hours — there was far too much food, and he kept refusing every
+time I offered to help or to bring something. I had a great evening. The next morning,
+to do the right thing, I sent him 35 dollars by e-transfer for my share of the
+groceries, plus a little extra as a thank-you, with a friendly message about how good
+the meal was. He never acknowledged the transfer. When I saw him in the lab he was
+polite but distant, and he has since turned down my last two invitations to grab lunch,
+saying he's busy. Another colleague hinted that I "offended" him, which makes no sense
+to me. I paid my fair share, I didn't freeload, and I even added extra to thank him.
+I genuinely do not understand what I did wrong.
     """
 
-    # Frames accept three forms (see models.CulturalFrame):
+    # Frames accept four forms (see models.CulturalFrame + run_scenario):
+    #
+    # 0. Auto-detect (PRODUCTION default) — pass no frames at all. Phase 0 infers
+    #    both frames from the scenario, constrained to CULTURE_DIMENSION_MENU
+    #    (Hofstede 6, binary high/low). The detected axes + rationale are saved to
+    #    outputs/{scenario_id}.json under frame_detection:
+    #        memory = run_scenario(raw_scenario=scenario, max_cycles=3)
     #
     # 1. Free-text label (back-compat) — used below.
     #
-    # 2. Dimensional axes (matches a Hofstede/Meyer fine-tune; less stereotyping):
+    # 2. Dimensional axes (matches the Hofstede fine-tune; less stereotyping):
     #    main_cultural_frame=[
-    #        CultureAxis(dimension="directness_of_negative_feedback", value="high / direct"),
-    #        CultureAxis(dimension="context", value="low"),
     #        CultureAxis(dimension="power_distance", value="low"),
+    #        CultureAxis(dimension="individualism", value="individualist"),
     #    ],
     #    challenger_cultural_frame=[
-    #        CultureAxis(dimension="directness_of_negative_feedback", value="low / indirect"),
-    #        CultureAxis(dimension="context", value="high"),
-    #        CultureAxis(dimension="face_honor_sensitivity", value="high"),
+    #        CultureAxis(dimension="power_distance", value="high"),
+    #        CultureAxis(dimension="individualism", value="collectivist"),
     #    ],
     #
     # 3. Neutral baseline (no frame for either agent — drops the frame scaffolding
-    #    and the "name your frame" lines, to test the output-verbosity hypothesis):
-    #    main_cultural_frame="", challenger_cultural_frame="",
+    #    and the "name your frame" lines, to test the output-verbosity hypothesis).
+    #    Note: "" is DISTINCT from passing nothing — "" forces neutral, omitting
+    #    the args triggers auto-detect (form 0):
+    #        main_cultural_frame="", challenger_cultural_frame="",
     #
     # Convergence metric is selectable on SessionMemory (convergence_metric=
     # "embedding" default, or "jaccard"); run both to A/B the loop behavior.
     memory = run_scenario(
         raw_scenario=scenario,
-        main_cultural_frame="Canadian low-context direct communication culture",
-        challenger_cultural_frame="Iranian high-context honor-based communication culture",
-        max_cycles=3,
+        max_cycles=2,
     )
 
     print("\n" + "=" * 60)

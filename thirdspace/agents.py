@@ -6,8 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 from langsmith import traceable
 from langsmith.run_helpers import get_current_run_tree
 
-from collections import Counter
-
 from models import (
     TheOccurring, OccurringNode,
     NodeReasoningGrid, NodeDimensionCell, ReflectionFlag,
@@ -16,19 +14,22 @@ from models import (
     FACET_LIST, DIMENSION_LIST, NUM_FACETS, NUM_CELLS,
     ConflictTypeSummary,
     CONFLICT_TYPE,
-    CulturalFrame,
+    CulturalFrame, CultureAxis, DetectedFrames, CULTURE_DIMENSION_MENU,
+    CulturalIdentity, WorkingPerspective,
+    NodeUpdateDelta, TheOccurringUpdateResult,
+    CompressedHistoryEntry, _content_similarity,
 )
 from llm import (
     call_llm, call_llm_json, call_llm_json_with_refinement,
     CHALLENGER_MODEL_ID, JUDGE_MODEL_ID,
 )
-from utils.context import compress_historical_context
 from utils.prompts import (
+    FRAME_DETECTION_SYSTEM, frame_detection_user, render_dimension_menu,
     REFORMULATION_SYSTEM, reformulation_user,
     critical_thinking_cell_system, critical_thinking_cell_user,
     challenger_cell_system, challenger_cell_user,
     NODE_UPDATE_SYSTEM, node_update_user,
-    MEDIATION_SYSTEM, mediation_user,
+    build_mediation_system, mediation_user,
     build_constrained_generation_system, constrained_generation_user,
     judge_output_system, judge_cycle_system, judge_user, judge_cycle_user,
     render_frame,
@@ -44,28 +45,10 @@ def _cell_pairs() -> list[tuple[str, str]]:
     return [(f, d) for f in FACET_LIST for d in DIMENSION_LIST]
 
 
-def _build_prior_findings(mediation: ImplyingNodes) -> str | None:
-    """Compact, prompt-ready summary of the previous cycle's meta-level guidance.
-
-    node_integrate already folds updated assumptions into The Occurring's
-    content, but the mediation's meta-level direction (reformulated query, new
-    objective) never reaches the cell agents. Surfacing it here lets the CT and
-    Challenger agents reason *differently* in cycle 2+ instead of re-deriving
-    the same grid. Returns None when there is nothing actionable to inject.
-    """
-    parts: list[str] = []
-    if mediation.updated_assumptions:
-        bullets = "\n".join(f"- {a}" for a in mediation.updated_assumptions)
-        parts.append("Updated assumptions from the previous cycle:\n" + bullets)
-    reformulated_query = mediation.wholeness.reformulated_query
-    if reformulated_query:
-        parts.append(f"Reformulated query: {reformulated_query}")
-    new_objective = mediation.wholeness.new_objective
-    if new_objective:
-        parts.append(f"New objective: {new_objective}")
-    if not parts:
-        return None
-    return "\n\n".join(parts)
+# Prior-cycle guidance for the CT cells is now produced as a structured, labeled
+# dict by ImplyingNodes.to_cell_context() (in models.py) and injected as JSON —
+# no lossy prose round-trip. The old _build_prior_findings prose builder was
+# removed in favor of that.
 
 
 logger = logging.getLogger(__name__)
@@ -113,6 +96,98 @@ def _parse_flags(raw_flags: list) -> list[ReflectionFlag]:
         elif isinstance(f, str) and f.strip():
             flags.append(ReflectionFlag(measure=f.strip(), issue="flagged by model"))
     return flags
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 — Cultural frame detection
+# Infers two contrasting dimensional frames from the raw scenario, constrained
+# to CULTURE_DIMENSION_MENU. Runs only when run_scenario was called with no
+# explicit frames (auto-detect / production path).
+# ---------------------------------------------------------------------------
+
+def _validate_axes(raw_axes: list, where: str) -> list[CultureAxis]:
+    """Keep only axes whose dimension is a menu key and whose value is one of
+    that dimension's allowed values (case-insensitive, trimmed). Invalid axes
+    are dropped with a log line; the canonical menu value is restored so
+    cross-frame comparisons stay exact. Duplicate dimensions: first valid wins.
+    """
+    valid: list[CultureAxis] = []
+    seen: set[str] = set()
+    for a in raw_axes or []:
+        if not isinstance(a, dict):
+            logger.warning(f"{where}: skipping non-object axis {a!r}")
+            continue
+        dim = str(a.get("dimension", "")).strip().lower()
+        val = str(a.get("value", "")).strip().lower()
+        allowed = CULTURE_DIMENSION_MENU.get(dim)
+        if allowed is None:
+            logger.warning(f"{where}: dropping unknown dimension {a.get('dimension')!r}")
+            continue
+        match = next((v for v in allowed if v.lower() == val), None)
+        if match is None:
+            logger.warning(
+                f"{where}: dropping illegal value {a.get('value')!r} for "
+                f"dimension {dim!r} (allowed: {allowed})"
+            )
+            continue
+        if dim in seen:
+            continue
+        seen.add(dim)
+        valid.append(CultureAxis(dimension=dim, value=match))
+    return valid
+
+
+def _axes_identical(a: list[CultureAxis], b: list[CultureAxis]) -> bool:
+    """True when both sides assign the same value on the same set of dimensions
+    (degenerate — no cultural contrast left to analyze)."""
+    return {(x.dimension, x.value) for x in a} == {(x.dimension, x.value) for x in b}
+
+
+@traceable(run_type="chain", name="frame_detection")
+def run_frame_detection(raw_scenario: str, scenario_id: str) -> DetectedFrames:
+    menu_str = render_dimension_menu(CULTURE_DIMENSION_MENU)
+    user = frame_detection_user(raw_scenario, menu_str)
+
+    def _attempt(user_prompt: str) -> tuple[list[CultureAxis], list[CultureAxis], str]:
+        result = call_llm_json(system=FRAME_DETECTION_SYSTEM, user=user_prompt)
+        main = _validate_axes(result.get("main", []), where="Frame detection (main)")
+        chall = _validate_axes(
+            result.get("challenger", []), where="Frame detection (challenger)"
+        )
+        return main, chall, str(result.get("rationale", ""))
+
+    main, chall, rationale = _attempt(user)
+
+    # One corrective retry if a side came back empty or the two frames don't
+    # actually contrast (a degenerate frame pair has no conflict to reason about).
+    if not main or not chall or _axes_identical(main, chall):
+        logger.warning(
+            f"[{scenario_id}] Frame detection degenerate "
+            f"(main={len(main)} axes, challenger={len(chall)} axes, "
+            f"identical={_axes_identical(main, chall)}); retrying once."
+        )
+        retry_user = user + (
+            "\n\nYOUR PREVIOUS RESPONSE WAS REJECTED. Use ONLY dimension names and "
+            "values from the menu above, choose 4 to 6 dimensions where the parties "
+            "DIFFER, and give main and challenger CONTRASTING values on those "
+            "dimensions. The two frames must not be identical."
+        )
+        main, chall, rationale = _attempt(retry_user)
+
+    # Production must not crash on a still-empty side. An empty axis list renders
+    # to "" via render_frame, i.e. neutral mode for that side — log it loudly.
+    if not main:
+        logger.error(
+            f"[{scenario_id}] Frame detection: main frame empty after retry; "
+            f"falling back to neutral for the main agent."
+        )
+    if not chall:
+        logger.error(
+            f"[{scenario_id}] Frame detection: challenger frame empty after retry; "
+            f"falling back to neutral for the challenger."
+        )
+
+    return DetectedFrames(main=main, challenger=chall, rationale=rationale)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +275,7 @@ def _ct_cell(
     facet: str,
     dimension: str,
     cycle: int,
-    prior_findings: str | None = None,
+    prior_context: dict | None = None,
 ) -> NodeDimensionCell:
     # ThreadPoolExecutor workers start with a fresh contextvars context, so we
     # re-register the active SessionMemory inside the worker before any LLM
@@ -210,7 +285,11 @@ def _ct_cell(
         result = call_llm_json_with_refinement(
             system=critical_thinking_cell_system(cultural_frame, facet, dimension),
             user=critical_thinking_cell_user(
-                occurring_json, facet, dimension, prior_findings=prior_findings
+                occurring_json, facet, dimension,
+                prior_context_json=(
+                    json.dumps(prior_context, ensure_ascii=False)
+                    if prior_context else None
+                ),
             ),
         )
     flags = _parse_flags(result.get("reflection_flags", []))
@@ -241,7 +320,11 @@ def run_critical_thinking(
     # other five truncated, instead of the entire Occurring (incl. raw_scenario)
     # on all NUM_CELLS calls.
     slim_contexts = {facet: occurring.slim_context(facet) for facet in FACET_LIST}
-    prior_findings = _build_prior_findings(prior_mediation) if prior_mediation else None
+    # Structured, labeled prior-cycle guidance (or None on cycle 1).
+    prior_context = (
+        prior_mediation.to_cell_context(prior_mediation.cycle)
+        if prior_mediation else None
+    )
     pairs = _cell_pairs()
     # Capture the active memory in the main thread; each worker re-registers
     # it on its own thread (see threading note in budget.py).
@@ -255,7 +338,7 @@ def run_critical_thinking(
         cells = list(ex.map(
             lambda fd: _ct_cell(
                 memory, slim_contexts[fd[0]], cultural_frame, fd[0], fd[1], cycle,
-                prior_findings=prior_findings,
+                prior_context=prior_context,
                 langsmith_extra=_cell_trace_extra(run, "main", fd[0], fd[1], cycle),
             ),
             pairs,
@@ -279,7 +362,6 @@ def _challenger_cell(
     memory,  # SessionMemory | None — captured in the parent thread
     occurring_json: str,
     challenger_frame: str,
-    main_frame: str,
     challenger_style: str,
     facet: str,
     dimension: str,
@@ -289,7 +371,7 @@ def _challenger_cell(
     with active_memory(memory):
         result = call_llm_json_with_refinement(
             system=challenger_cell_system(
-                challenger_frame, main_frame, challenger_style, facet, dimension
+                challenger_frame, challenger_style, facet, dimension
             ),
             user=challenger_cell_user(
                 occurring_json=occurring_json,
@@ -317,24 +399,25 @@ def _challenger_cell(
 @traceable(run_type="chain", name="challenger")
 def run_challenger(
     occurring: TheOccurring,
-    challenger_frame: CulturalFrame,
-    main_frame: CulturalFrame,
+    challenger_identity: CulturalIdentity,
+    challenger_working_perspective: WorkingPerspective,
     cycle: int,
     challenger_style: str,
 ) -> NodeReasoningGrid:
-    # The challenger is fully isolated: it never receives the main agent's grid,
-    # the mediation, or prior-cycle findings — only The Occurring and its own
-    # frame. Mediation is where the two independent grids are compared.
+    # The challenger is fully isolated: it never receives the main agent's grid
+    # or the main agent's frame — only The Occurring and its own frame. Mediation
+    # is where the two independent grids are compared.
+    #
+    # Its frame is the structured cultural IDENTITY (fixed across cycles) plus the
+    # mediator's WORKING PERSPECTIVE (prose, additive) — the identity can no longer
+    # silently decay into free-text across cycles. "" => neutral mode.
     #
     # Future RAG/retrieval would plug in here: enrich the user prompt per cell
-    # with retrieved context scoped to challenger_frame. Wire it up by editing
+    # with retrieved context scoped to the challenger frame. Wire it up by editing
     # _challenger_cell when a corpus and retriever exist.
-    #
-    # Render both frames once; "" puts the cell prompts into neutral mode. The
-    # challenger still knows the contrasting frame's name (main_frame) — that's
-    # scenario context, not the main agent's reasoning.
-    challenger_frame = render_frame(challenger_frame)
-    main_frame = render_frame(main_frame)
+    challenger_frame = challenger_working_perspective.render_for_prompt(
+        challenger_identity
+    )
     slim_contexts = {facet: occurring.slim_context(facet) for facet in FACET_LIST}
 
     pairs = _cell_pairs()
@@ -343,14 +426,14 @@ def run_challenger(
     if run is not None:
         run.add_metadata({
             "cycle": cycle, "agent": "challenger",
-            "challenger_frame": challenger_frame, "main_frame": main_frame,
+            "challenger_frame": challenger_frame,
         })
     with ThreadPoolExecutor(max_workers=_CELL_WORKERS) as ex:
         cells = list(ex.map(
             lambda fd: _challenger_cell(
                 memory,
                 slim_contexts[fd[0]],
-                challenger_frame, main_frame, challenger_style,
+                challenger_frame, challenger_style,
                 fd[0], fd[1], cycle,
                 langsmith_extra=_cell_trace_extra(run, "challenger", fd[0], fd[1], cycle),
             ),
@@ -372,8 +455,9 @@ def run_mediation(
     occurring: TheOccurring,
     main_grid: NodeReasoningGrid,
     challenger_grid: NodeReasoningGrid,
-    all_mediation_history: list[ImplyingNodes],
+    compressed_history: list[CompressedHistoryEntry],
     cycle: int,
+    mediator_frame: str,
 ) -> ImplyingNodes:
     occurring_json = occurring.to_nodes_json()
 
@@ -392,12 +476,14 @@ def run_mediation(
             }
     cell_pairs_json = json.dumps(cell_pairs_by_facet, ensure_ascii=False)
 
-    raw_history = [m.model_dump() for m in all_mediation_history]
-    compressed = compress_historical_context(raw_history)
-    compressed_history_json = json.dumps(compressed, ensure_ascii=False)
+    # History is pre-compressed once per cycle by node_mediation (O(1) per cycle),
+    # so the prompt no longer re-flattens the whole mediation history every call.
+    compressed_history_json = json.dumps(
+        [e.model_dump() for e in compressed_history], ensure_ascii=False
+    )
 
     result = call_llm_json(
-        system=MEDIATION_SYSTEM,
+        system=build_mediation_system(mediator_frame),
         user=mediation_user(
             occurring_json=occurring_json,
             cell_pairs_json=cell_pairs_json,
@@ -456,17 +542,31 @@ def run_mediation(
 # Turns the loop from a no-op into a real refinement cycle.
 # ---------------------------------------------------------------------------
 
+# Node-update delta thresholds. Above SIMILARITY = treat as unchanged regardless
+# of the model's flag; below CHANGE = treat as changed regardless. Between them is
+# the ambiguous band where we defer to the model's self-reported `changed` flag.
+SIMILARITY_THRESHOLD = 0.97
+CHANGE_THRESHOLD = 0.85
+
+
 @traceable(run_type="chain", name="node_update")
 def run_node_update(
     occurring: TheOccurring,
     mediation: ImplyingNodes,
-) -> TheOccurring:
-    # Nothing to fold in: keep the occurring untouched.
-    if not mediation.updated_assumptions and not _wholeness_has_signal(mediation.wholeness):
-        return occurring
-
-    # Stamp updated nodes with the mediation cycle that produced the change.
+) -> TheOccurringUpdateResult:
     cycle = mediation.cycle
+
+    # Nothing to fold in: return the occurring untouched, with trivial deltas.
+    if not mediation.updated_assumptions and not _wholeness_has_signal(mediation.wholeness):
+        deltas = [
+            NodeUpdateDelta(
+                facet=n.facet, similarity=1.0,
+                model_claimed_changed=False, actually_changed=False,
+                content_kept=n.content, content_proposed=n.content, conflict=False,
+            )
+            for n in occurring.nodes
+        ]
+        return TheOccurringUpdateResult(occurring=occurring, deltas=deltas)
 
     result = call_llm_json(
         system=NODE_UPDATE_SYSTEM,
@@ -487,35 +587,78 @@ def run_node_update(
 
     existing = {n.facet: n for n in occurring.nodes}
     nodes: list[OccurringNode] = []
+    deltas: list[NodeUpdateDelta] = []
     for n in raw_nodes:
         facet = n["facet"]
         prev = existing.get(facet)
-        changed = bool(n.get("changed", False))
-        if not changed and prev is not None:
-            # Model claims this node is unchanged: trust the original content,
-            # not its possibly-reworded copy (prevents silent drift between cycles).
-            content = prev.content
-            assumptions = list(prev.assumptions)
+        model_claimed_changed = bool(n.get("changed", False))
+        proposed_content = n["content"]
+        proposed_assumptions = n.get("assumptions", [])
+
+        if prev is None:
+            # Brand new node — no prior content to compare against.
+            sim = 0.0
+            actually_changed = True
+            content_kept = proposed_content
+            assumptions = proposed_assumptions
+            conflict = False
         else:
-            content = n["content"]
-            assumptions = n.get("assumptions", [])
+            sim = _content_similarity(prev.content, proposed_content)
+            # Override the model's flag with the objective measurement at the
+            # extremes; defer to it only in the ambiguous middle band.
+            if sim >= SIMILARITY_THRESHOLD:
+                actually_changed = False
+                content_kept = prev.content          # keep original → no silent drift
+                assumptions = list(prev.assumptions)
+            elif sim <= CHANGE_THRESHOLD:
+                actually_changed = True
+                content_kept = proposed_content
+                assumptions = proposed_assumptions
+            else:
+                actually_changed = model_claimed_changed
+                content_kept = proposed_content if model_claimed_changed else prev.content
+                assumptions = (
+                    proposed_assumptions if model_claimed_changed
+                    else list(prev.assumptions)
+                )
+            # Flag where the model's claim disagreed with the measurement.
+            conflict = (
+                (model_claimed_changed and sim >= SIMILARITY_THRESHOLD)
+                or (not model_claimed_changed and sim <= CHANGE_THRESHOLD)
+            )
+            if conflict:
+                logger.warning(
+                    f"[node_update cycle={cycle}] Node '{facet}': model claimed "
+                    f"changed={model_claimed_changed} but similarity={sim:.3f}. "
+                    f"Using measured result: actually_changed={actually_changed}."
+                )
+
         nodes.append(OccurringNode(
             node_id=n.get("node_id", facet),
             facet=facet,
-            content=content,
+            content=content_kept,
             assumptions=assumptions,
             # Only advance the stamp on nodes the update actually touched.
-            last_updated_cycle=cycle if changed else (
+            last_updated_cycle=cycle if actually_changed else (
                 prev.last_updated_cycle if prev else 0
             ),
         ))
+        deltas.append(NodeUpdateDelta(
+            facet=facet, similarity=sim,
+            model_claimed_changed=model_claimed_changed,
+            actually_changed=actually_changed,
+            content_kept=content_kept,
+            content_proposed=proposed_content,
+            conflict=conflict,
+        ))
 
     nodes = _sort_by_facet(nodes)
-    return TheOccurring(
+    updated = TheOccurring(
         scenario_id=occurring.scenario_id,
         raw_scenario=occurring.raw_scenario,
         nodes=nodes,
     )
+    return TheOccurringUpdateResult(occurring=updated, deltas=deltas)
 
 
 def _wholeness_has_signal(wholeness: WholenessImplyingNodes) -> bool:
@@ -537,6 +680,7 @@ def _wholeness_has_signal(wholeness: WholenessImplyingNodes) -> bool:
 def run_constrained_generation(
     occurring: TheOccurring,
     mediation_history: list[ImplyingNodes],
+    mediator_frame: str,
     evaluation_feedback: str | None = None,
 ) -> str:
     if not mediation_history:
@@ -553,39 +697,19 @@ def run_constrained_generation(
         all_implications.extend(c.implication for c in m.conflicts)
     all_findings_json = json.dumps(all_implications, ensure_ascii=False)
 
-    # Cross-cycle conflict type summary
+    # Cross-cycle conflict type summary — pool the per-cycle summaries already
+    # computed on each ImplyingNodes instead of re-flattening every conflict.
     all_conflicts = [c for m in mediation_history for c in m.conflicts]
-    cross_cycle_summary: ConflictTypeSummary | None = None
-    if all_conflicts:
-        counts: Counter[str] = Counter(c.conflict_type for c in all_conflicts)
-        total = len(all_conflicts)
-        dominant = counts.most_common(1)[0][0]
-        cross_cycle_summary = ConflictTypeSummary(
-            semantic=counts.get("semantic", 0),
-            attributional=counts.get("attributional", 0),
-            normative=counts.get("normative", 0),
-            structural=counts.get("structural", 0),
-            factual=counts.get("factual", 0),
-            total=total,
-            dominant_type=dominant,
-            structural_fraction=counts.get("structural", 0) / total,
-            conversational_fraction=sum(
-                1 for c in all_conflicts if c.resolvability == "conversational"
-            ) / total,
-            unresolvable_fraction=sum(
-                1 for c in all_conflicts if c.resolvability == "unresolvable"
-            ) / total,
-            structural_severity_score=sum(
-                c.severity for c in all_conflicts if c.conflict_type == "structural"
-            ) / (5 * total),
-        )
+    cross_cycle_summary = ConflictTypeSummary.aggregate(
+        [m.conflict_type_summary for m in mediation_history]
+    )
 
     salient = sorted(
         [c for c in all_conflicts if c.severity >= 3],
         key=lambda c: c.severity, reverse=True,
     )
 
-    return call_llm(
+    doc = call_llm(
         system=build_constrained_generation_system(cross_cycle_summary),
         user=constrained_generation_user(
             occurring_json=occurring.to_nodes_json(),
@@ -602,6 +726,18 @@ def run_constrained_generation(
         ),
         temperature=0.5,
     )
+
+    # Auditable provenance header — deterministically prepended (not LLM-authored)
+    # so it is always present and exact. Names the standpoint the analysis was
+    # mediated from, so a reader can contextualize "neutral"-looking findings.
+    metadata = (
+        "──────────────────────────────────────────────\n"
+        f'ANALYSIS FRAME: mediated from a "{mediator_frame}" standpoint. A finding '
+        "that reads as neutral from this frame may systematically advantage one "
+        "party; read accordingly.\n"
+        "──────────────────────────────────────────────\n\n"
+    )
+    return metadata + doc
 
 
 # ---------------------------------------------------------------------------
