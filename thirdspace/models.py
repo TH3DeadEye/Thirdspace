@@ -809,14 +809,14 @@ class SessionMemory(BaseModel):
     regen_attempts: int = 0
     output_score_threshold: int = 3
 
-    # Consensus plateau as a secondary convergence signal. If the last two
-    # cycle judges both score consensus >= threshold and differ by <= 1, the
-    # loop terminates even if the mediator did not self-declare converged.
-    consensus_plateau_threshold: int = 4
-    
-        # Structural convergence guard. If the mediator self-declares converged but
-    # the cross-cycle similarity is below the relevant threshold, treat it as
-    # premature (content still moving) and keep looping.
+    # Bidirectional structural convergence. The measured cross-cycle similarity
+    # is a first-class termination signal, not merely a veto: when the mediator
+    # self-declares converged but similarity is below threshold, the loop
+    # continues (premature declaration); when the mediator says NOT converged
+    # but similarity is at/above threshold AND the conflict-type distribution is
+    # stable, the loop terminates anyway (under-declaration — observed to burn a
+    # full ~170-call cycle re-deriving identical findings). convergence_reason
+    # records which signal actually ended the loop.
     #
     # convergence_metric selects HOW that similarity is measured:
     #   "jaccard"   — positional overlap of (facet, dimension) conflict cells.
@@ -826,6 +826,9 @@ class SessionMemory(BaseModel):
     convergence_metric: Literal["jaccard", "embedding"] = "embedding"
     jaccard_convergence_threshold: float = 0.7
     embedding_convergence_threshold: float = 0.85
+    convergence_reason: Literal[
+        "llm_declared", "structural_convergence", "max_cycles"
+    ] | None = None
 
     # Cost / latency guardrails. call_llm increments llm_calls_made and
     # total_latency_ms on every Bedrock call. BudgetExceeded raises when

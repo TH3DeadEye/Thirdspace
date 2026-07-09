@@ -3,7 +3,7 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, END
 
-from metrics import convergence_similarity
+from metrics import convergence_similarity, type_distribution_stable
 
 from models import (
     SessionMemory, CompressedHistoryEntry, WorkingPerspective, CulturalIdentity,
@@ -205,76 +205,71 @@ def node_judge(state: GraphState) -> GraphState:
     return {"memory": mem}
 
 
-def _consensus_plateau(mem: SessionMemory) -> bool:
-    """Multi-signal convergence: detect when consensus scores have plateaued.
-
-    Returns True if the last two cycle judges both meet the consensus threshold
-    and differ by no more than 1. Returns False when fewer than two cycle
-    judges exist.
-    """
-    if len(mem.cycle_judge_scores) < 2:
-        return False
-    last, prev = mem.cycle_judge_scores[-1], mem.cycle_judge_scores[-2]
-    threshold = mem.consensus_plateau_threshold
-    return (
-        last.consensus >= threshold
-        and prev.consensus >= threshold
-        and abs(last.consensus - prev.consensus) <= 1
-    )
-
-
 def should_loop(state: GraphState) -> str:
     """Decide whether to terminate after a mediation cycle.
 
-    The in-loop judge (`evaluate_cycle`) only runs on the path that continues
-    looping; terminating cycles skip it to save budget. The judge then feeds
-    the plateau check via `should_continue_after_judge`.
-    """
+    Bidirectional convergence: the LLM's converged flag is advisory in BOTH
+    directions (observed failing both ways — premature declarations AND a run
+    where cycles 0/1 produced identical conflict profiles yet converged stayed
+    false, burning ~170 calls re-deriving the same findings). The measured
+    cross-cycle similarity is the arbiter:
 
+      LLM true  + similarity below threshold  -> continue (premature; vetoed)
+      LLM false + similarity at/above threshold
+                + stable conflict-type mix    -> terminate (structural_convergence)
+
+    The in-loop judge (`evaluate_cycle`) only runs on the path that continues
+    looping; terminating cycles skip it to save budget. Its scores are
+    telemetry only — they no longer gate termination (the old consensus-plateau
+    check conflated "parties agree" with "analysis has stabilized" and could
+    never fire for structurally-dominant scenarios, which correctly score
+    consensus 1-2).
+    """
     mem = state["memory"]
     history = mem.mediation_history
 
     if mem.current_cycle >= mem.max_cycles:
-        logger.info(f"{mem.scenario_id} Max cycles reached")
+        if not mem.converged:
+            mem.convergence_reason = "max_cycles"
+        logger.info(f"[{mem.scenario_id}] Max cycles reached")
         return "generate"
 
+    if len(history) >= 2:
+        sim = convergence_similarity(
+            history[-2], history[-1], mem.convergence_metric
+        )
+        threshold = (
+            mem.embedding_convergence_threshold
+            if mem.convergence_metric == "embedding"
+            else mem.jaccard_convergence_threshold
+        )
+        if mem.converged and sim < threshold:
+            logger.info(
+                f"[{mem.scenario_id}] LLM converged but "
+                f"{mem.convergence_metric} similarity={sim:.2f} < {threshold}; "
+                f"content still moving, continuing"
+            )
+            return "evaluate_cycle"
+        if not mem.converged and sim >= threshold and type_distribution_stable(
+            history[-2], history[-1]
+        ):
+            mem.converged = True
+            mem.convergence_reason = "structural_convergence"
+            logger.info(
+                f"[{mem.scenario_id}] structural_convergence: "
+                f"{mem.convergence_metric} similarity={sim:.2f} >= {threshold} "
+                f"and conflict-type distribution stable; forcing converged=True "
+                f"(LLM under-declared)"
+            )
+            return "generate"
+
     if mem.converged:
-        if len(history) >= 2:
-            sim = convergence_similarity(
-                history[-2], history[-1], mem.convergence_metric
-            )
-            threshold = (
-                mem.embedding_convergence_threshold
-                if mem.convergence_metric == "embedding"
-                else mem.jaccard_convergence_threshold
-            )
-            if sim < threshold:
-                logger.info(
-                    f"[{mem.scenario_id}] LLM converged but "
-                    f"{mem.convergence_metric} similarity={sim:.2f} < {threshold}; "
-                    f"content still moving, continuing"
-                )
-                return "evaluate_cycle"
+        mem.convergence_reason = "llm_declared"
         logger.info(f"[{mem.scenario_id}] Converged at cycle {mem.current_cycle}")
         return "generate"
 
     logger.info(f"[{mem.scenario_id}] Not converged, evaluating cycle {mem.current_cycle}")
     return "evaluate_cycle"
-
-def should_continue_after_judge(state: GraphState) -> str:
-    """After scoring the cycle, check the secondary plateau signal.
-
-    If two consecutive cycle judges show a high, stable consensus, terminate
-    early. Otherwise integrate findings and run another cycle.
-    """
-    mem = state["memory"]
-    if _consensus_plateau(mem):
-        logger.info(
-            f"[{mem.scenario_id}] Consensus plateau at cycle {mem.current_cycle}; "
-            f"terminating loop"
-        )
-        return "generate"
-    return "integrate"
 
 
 def should_regenerate(state: GraphState) -> str:
@@ -321,18 +316,13 @@ def build_graph() -> StateGraph:
     graph.add_edge("challenger", "mediation")
 
     # mediation -> should_loop -> {evaluate_cycle | generate}
-    # evaluate_cycle -> should_continue_after_judge -> {integrate | generate}
-    # integrate -> main_agent (loop)
+    # evaluate_cycle -> integrate -> main_agent (loop)
     graph.add_conditional_edges(
         "mediation",
         should_loop,
         {"evaluate_cycle": "evaluate_cycle", "generate": "generate"},
     )
-    graph.add_conditional_edges(
-        "evaluate_cycle",
-        should_continue_after_judge,
-        {"integrate": "integrate", "generate": "generate"},
-    )
+    graph.add_edge("evaluate_cycle", "integrate")
     graph.add_edge("integrate", "main_agent")
 
     graph.add_edge("generate", "judge")

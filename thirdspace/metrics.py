@@ -1,4 +1,5 @@
 import math
+from collections import Counter
 
 from models import ImplyingNodes
 from llm import embed_text
@@ -82,3 +83,30 @@ def convergence_similarity(
     if metric == "jaccard":
         return conflict_jaccard(prev, curr)
     return conflict_embedding_similarity(prev, curr)
+
+
+def conflict_type_distribution(m: ImplyingNodes) -> Counter:
+    """Per-type conflict counts for one cycle, e.g. {"structural": 6, ...}."""
+    return Counter(c.conflict_type for c in m.conflicts)
+
+
+def type_distribution_stable(
+    prev: ImplyingNodes,
+    curr: ImplyingNodes,
+    tolerance: int = 1,
+) -> bool:
+    """Whether two cycles found essentially the same mix of conflict types.
+
+    Stability = the total absolute drift across per-type counts is within
+    `tolerance` conflicts. Similarity metrics answer "is the substance the
+    same?"; this answers "is the SHAPE of the disagreement the same?" — a new
+    conflict type appearing means the analysis is still uncovering new
+    structure even if the prose reads similar, so the loop should continue.
+    """
+    prev_dist = conflict_type_distribution(prev)
+    curr_dist = conflict_type_distribution(curr)
+    drift = sum(
+        abs(prev_dist[t] - curr_dist[t])
+        for t in set(prev_dist) | set(curr_dist)
+    )
+    return drift <= tolerance

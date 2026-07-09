@@ -16,7 +16,7 @@ import graph as g
 import metrics
 from models import (
     SessionMemory, JudgeScore, ImplyingNodes, DetectedFrames, CultureAxis,
-    TheOccurringUpdateResult, NodeUpdateDelta,
+    TheOccurringUpdateResult, NodeUpdateDelta, CellConflict,
 )
 from tests.fixtures import make_occurring, make_grid, make_mediation, make_wholeness
 
@@ -182,22 +182,48 @@ class TestEvaluateCycleSkippedOnTerminal(unittest.TestCase):
         self.assertEqual(len(out.cycle_judge_scores), 1)
 
 
-class TestConsensusPlateau(unittest.TestCase):
-    """Convergence plateau is a secondary termination signal: two consecutive
-    cycle-judge scores at/above the threshold should terminate the loop even
-    if the mediator did not flag converged=True."""
+def _conflict(facet: str, dimension: str, ctype: str) -> CellConflict:
+    """A valid CellConflict for convergence tests. Resolvability is chosen per
+    type so the taxonomy validators pass."""
+    resolvability = "conversational" if ctype == "semantic" else "structural_change"
+    return CellConflict(
+        facet=facet, dimension=dimension,
+        main_summary="main view", challenger_summary="challenger view",
+        challenger_response_type="challenge",
+        implication=(
+            "This reveals that the parties are operating with fundamentally "
+            "different relational frameworks beneath the surface disagreement."
+        ),
+        conflict_type=ctype,
+        conflict_type_rationale="The parties apply incompatible interpretive rules to the same moment.",
+        severity=5,
+        resolvability=resolvability,
+    )
 
-    def _install_never_converged_stubs(self, g_module):
-        """Stubs where mediation never self-declares converged. The plateau
-        check is the only way the loop can terminate before max_cycles."""
+
+class TestStructuralConvergence(unittest.TestCase):
+    """Bidirectional convergence: when the mediator never self-declares
+    converged but consecutive cycles produce essentially identical conflict
+    profiles, the measured similarity must terminate the loop.
+
+    This is the run-019edbf4 pathology: cycles 0 and 1 found the same 11
+    conflicts with the same type distribution, converged stayed false, and a
+    full ~170-call cycle was burned re-deriving identical findings."""
+
+    def _install(self, g_module, conflicts_by_cycle):
         g_module.run_reformulation = lambda raw_scenario, scenario_id: make_occurring(scenario_id)
         g_module.run_critical_thinking = lambda occurring, cultural_frame, cycle, prior_mediation=None: make_grid("main", cycle)
         g_module.run_challenger = lambda **kw: make_grid("challenger", kw["cycle"])
-        g_module.run_mediation = lambda **kw: make_mediation(cycle=kw["cycle"], converged=False)
+
+        def med(**kw):
+            m = make_mediation(cycle=kw["cycle"], converged=False)
+            m.conflicts = conflicts_by_cycle(kw["cycle"])
+            return m
+
+        g_module.run_mediation = med
         g_module.run_node_update = _stub_node_update
-        # Cycle judge: always returns consensus=5 so two in a row trigger plateau.
         g_module.run_cycle_judge = lambda mediation, cycle: JudgeScore(
-            cycle=cycle, empathy=5, consensus=5, escalation_risk=2,
+            cycle=cycle, empathy=5, consensus=1, escalation_risk=2,
             cultural_insight=5, intervention_fidelity=5, reasoning="cycle ok",
         )
         g_module.run_judge = lambda final_output, mediation_history, cycle: JudgeScore(
@@ -208,17 +234,44 @@ class TestConsensusPlateau(unittest.TestCase):
             lambda occurring, mediation_history, mediator_frame=None, evaluation_feedback=None: "DOC"
         )
 
-    def test_plateau_triggers_termination_before_max_cycles(self):
-        self._install_never_converged_stubs(g)
+    def test_identical_conflict_profiles_force_termination(self):
+        # Every cycle re-derives the same conflicts (jaccard=1.0, same type
+        # mix) and the mediator never declares converged.
+        same = lambda cycle: [
+            _conflict("individuals", "assumptions", "structural"),
+            _conflict("process", "evidence", "normative"),
+        ]
+        self._install(g, same)
         compiled = g.build_graph()
-        # max_cycles=5 so plateau is the actual termination cause.
         out = compiled.invoke({"memory": _mem(max_cycles=5)})["memory"]
-        # Cycle 0 -> evaluate (score 1) -> integrate -> cycle 1 -> evaluate (score 2)
-        # Now two consecutive consensus=5 scores, plateau triggers, go to generate.
-        self.assertEqual(len(out.cycle_judge_scores), 2)
-        # The loop terminated well before max_cycles=5.
-        self.assertLess(out.current_cycle, 5)
+        # Cycle 0 -> only one mediation, no pair to compare -> loop.
+        # Cycle 1 -> similarity 1.0 + stable type mix -> forced termination.
         self.assertEqual(out.current_cycle, 2)
+        self.assertTrue(out.converged)
+        self.assertEqual(out.convergence_reason, "structural_convergence")
+        # Only the non-terminal cycle was judged.
+        self.assertEqual(len(out.cycle_judge_scores), 1)
+
+    def test_shifting_type_distribution_blocks_forced_termination(self):
+        # Same cells fire every cycle (jaccard=1.0) but the type MIX keeps
+        # changing — the analysis is still uncovering new structure, so the
+        # forced-termination path must not fire and the loop runs to max.
+        def shifting(cycle):
+            if cycle % 2 == 0:
+                return [
+                    _conflict("individuals", "assumptions", "structural"),
+                    _conflict("process", "evidence", "structural"),
+                ]
+            return [
+                _conflict("individuals", "assumptions", "semantic"),
+                _conflict("process", "evidence", "normative"),
+            ]
+        self._install(g, shifting)
+        compiled = g.build_graph()
+        out = compiled.invoke({"memory": _mem(max_cycles=3)})["memory"]
+        self.assertEqual(out.current_cycle, 3)
+        self.assertFalse(out.converged)
+        self.assertEqual(out.convergence_reason, "max_cycles")
 
 
 class TestBackwardsCompatibleJudgeScores(unittest.TestCase):
@@ -257,8 +310,8 @@ class TestEmbeddingConvergence(unittest.TestCase):
         g_module.run_mediation = lambda **kw: self._med(
             kw["cycle"], kw["cycle"] >= 1, blocks[kw["cycle"]]
         )
-        # Consensus BELOW the plateau threshold (4), so the plateau signal never
-        # fires and the embedding guard is the only loop control.
+        # Cycle-judge scores are telemetry only; the embedding guard is the
+        # loop control under test here.
         g_module.run_cycle_judge = lambda mediation, cycle: JudgeScore(
             cycle=cycle, empathy=5, consensus=2, escalation_risk=2,
             cultural_insight=5, intervention_fidelity=5, reasoning="cycle ok",
