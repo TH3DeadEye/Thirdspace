@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import time
 import logging
 from typing import Any
@@ -8,6 +9,7 @@ from functools import lru_cache
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from json_repair import repair_json
 from langsmith import traceable
 from langsmith.run_helpers import get_current_run_tree
 
@@ -113,7 +115,7 @@ def call_llm(
     user: str,
     model: str = BEDROCK_MODEL_ID,
     max_tokens: int = 8000,
-    retries: int = 3,
+    retries: int = 6,
     temperature:float = 0.3,
 ) -> str:
     # Budget guard: refuse to issue the call if the scenario is out of budget.
@@ -147,16 +149,22 @@ def call_llm(
                     f"Response hit maxTokens={max_tokens} and was truncated; "
                     f"downstream JSON parsing may fail. Raise max_tokens if this recurs."
                 )
-            record_success(latency_ms)
+            usage = response.get("usage", {})
+            record_success(latency_ms, usage)
             _annotate_llm_run(
-                model, response.get("usage", {}), temperature, max_tokens, latency_ms
+                model, usage, temperature, max_tokens, latency_ms
             )
             return text
         except ClientError as e:
             code = e.response["Error"]["Code"]
             if code in ("ThrottlingException", "TooManyRequestsException"):
-                wait = 2 ** attempt * 5
-                logger.warning(f"Throttled, waiting {wait}s (attempt {attempt+1}/{retries})")
+                # Exponential backoff capped at 60s, plus full jitter. The cell
+                # agents fire many calls at once; without jitter their retries
+                # re-synchronize and slam the same per-minute quota together.
+                wait = min(60, 2 ** attempt * 5) + random.uniform(0, 5)
+                logger.warning(
+                    f"Throttled, waiting {wait:.1f}s (attempt {attempt+1}/{retries})"
+                )
                 time.sleep(wait)
             elif code == "ValidationException":
                 logger.error(f"Bedrock validation error: {e}")
@@ -219,7 +227,10 @@ def embed_text(
                 )
                 time.sleep(2 ** attempt)
                 continue
-            record_success(latency_ms)
+            record_success(
+                latency_ms,
+                {"inputTokens": payload.get("inputTextTokenCount", 0) or 0},
+            )
             return embedding
         except ClientError as e:
             code = e.response["Error"]["Code"]
@@ -278,9 +289,30 @@ def call_llm_json(system: str, user: str, **kwargs) -> Any:
                 first_error = e
             continue
 
+    # Strict parsing failed on every candidate. Fall back to json_repair, a
+    # tolerant parser that fixes the malformations Claude actually produces but
+    # strict JSON cannot: unescaped inner quotes (e.g. echoing a phrase like
+    # "green light" inside a content string), trailing commas, and truncated
+    # tails. We only reach here on genuinely broken output, so a heuristic
+    # recovery is strictly better than crashing the whole run.
+    for block in _candidate_blocks(raw):
+        try:
+            repaired = repair_json(block, return_objects=True)
+        except Exception:
+            continue
+        # Our prompts always return an object or array; a non-empty dict/list
+        # means json_repair recovered something usable. Anything else (""/{}/[])
+        # is a failed recovery — try the next candidate.
+        if isinstance(repaired, (dict, list)) and repaired:
+            logger.warning(
+                "Strict JSON parse failed (%s); recovered with json_repair.",
+                first_error,
+            )
+            return repaired
+
     logger.error(
-        "Model response was not valid JSON (length=%d chars). If the snippet "
-        "below looks cut off, the call likely hit maxTokens and was truncated.\n%s",
+        "Model response was not valid JSON and json_repair could not recover it "
+        "(length=%d chars). First 1500 chars:\n%s",
         len(raw), raw[:1500],
     )
     raise ValueError(
@@ -330,11 +362,18 @@ REFLECTION_INSTRUCTIONS: dict[str, str] = {
 }
 
 
+# Refinement retry cap. Nearly every cell fails self-validation at least once
+# (reflection_flags are almost always populated), so each attempt is an extra
+# LLM call per cell — this is the single biggest cost/latency multiplier.
+# Tune down via env for fast runs.
+MAX_REFINE_ATTEMPTS = int(os.environ.get("THIRDSPACE_REFINE_ATTEMPTS", "2"))
+
+
 @traceable(run_type="chain", name="cell_refinement")
 def call_llm_json_with_refinement(
     system: str,
     user: str,
-    max_refine_attempts: int = 2,
+    max_refine_attempts: int = MAX_REFINE_ATTEMPTS,
     **kwargs,
 ) -> Any:
     """

@@ -834,6 +834,12 @@ class SessionMemory(BaseModel):
     llm_call_budget: int = 1000
     llm_calls_made: int = 0
     total_latency_ms: int = 0
+    # Token accounting. call_llm accumulates Bedrock usage on every successful
+    # response so the persisted session carries exact input/output token totals
+    # (previously these lived only in LangSmith).
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_tokens: int = 0
     consecutive_failures: int = 0
     max_consecutive_failures: int = 5
     final_output: str | None = None

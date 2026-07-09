@@ -3,3 +3,4 @@ langgraph>=0.2.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 langsmith>=0.8.0
+json-repair>=0.30.0

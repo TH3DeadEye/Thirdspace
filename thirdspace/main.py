@@ -174,7 +174,9 @@ I genuinely do not understand what I did wrong.
     # "embedding" default, or "jaccard"); run both to A/B the loop behavior.
     memory = run_scenario(
         raw_scenario=scenario,
-        max_cycles=2,
+        # One cycle: multiple cycles at ~150 calls each cannot fit the account's
+        # Bedrock rate limit in any reasonable wall time. Raise after a quota bump.
+        max_cycles=1,
     )
 
     print("\n" + "=" * 60)
@@ -201,3 +203,12 @@ I genuinely do not understand what I did wrong.
         last = memory.mediation_history[-1]
         print(f"Agreements found:  {len(last.agreements)}")
         print(f"Conflicts found:   {len(last.conflicts)}")
+
+    print("\n" + "=" * 60)
+    print("TOKEN & CALL USAGE")
+    print("=" * 60)
+    print(f"LLM calls:         {memory.llm_calls_made}")
+    print(f"Input tokens:      {memory.total_input_tokens:,}")
+    print(f"Output tokens:     {memory.total_output_tokens:,}")
+    print(f"Total tokens:      {memory.total_tokens:,}")
+    print(f"Total latency:     {memory.total_latency_ms / 1000:.1f}s")
