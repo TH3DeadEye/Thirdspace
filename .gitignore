@@ -15,3 +15,7 @@ venv/
 thirdspace classes part1.txt
 thirdspace/aws/
 docs/
+# eval datasets and derived artifacts (fetch via eval/fetch_data.py)
+eval/data/
+eval/gold/
+eval/results/
