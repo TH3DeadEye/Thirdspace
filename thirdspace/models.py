@@ -1,5 +1,5 @@
 import json
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel
 from typing import Literal
 from pydantic import Field
 from pydantic import field_validator, model_validator
@@ -860,8 +860,12 @@ class SessionMemory(BaseModel):
             )
         return self
 
-    @computed_field
     @property
     def judge_scores(self) -> list[JudgeScore]:
-        """Backwards-compatible combined view of all judge scores."""
+        """Backwards-compatible combined view of all judge scores.
+
+        Deliberately NOT a @computed_field: both source lists are already
+        serialized, so serializing this too would duplicate every score in
+        persisted session JSON.
+        """
         return [*self.cycle_judge_scores, *self.output_judge_scores]
