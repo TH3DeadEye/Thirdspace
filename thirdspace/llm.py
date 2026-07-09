@@ -324,49 +324,31 @@ def call_llm_json(system: str, user: str, **kwargs) -> Any:
 # Context engineering utilities (from Omid's context engineering update)
 # ---------------------------------------------------------------------------
 
-# Reflection measure → corrective instruction.
-# Used by call_llm_json_with_refinement when a cell flags a failed measure.
-REFLECTION_INSTRUCTIONS: dict[str, str] = {
-    "clarity": (
-        "Reflect on Clarity: Is this completely clear and unambiguous? "
-        "Paraphrase the core argument and bring concrete examples to ground it."
-    ),
-    "correctness": (
-        "Reflect on Correctness: Is this assessment accurate and objective? "
-        "Ensure the analysis has not been misled by the narrator's emotional framing."
-    ),
-    "precision": (
-        "Reflect on Precision: Is this too vague or generalized? "
-        "Bring specific granular details and be explicitly descriptive about the dynamics."
-    ),
-    "proportion": (
-        "Reflect on Proportion: Is this directly related to the core conflict? "
-        "Analyze how heavily this point affects the overall result."
-    ),
-    "depth": (
-        "Reflect on Depth: Have you bypassed the underlying complexities? "
-        "Address structural difficulties and root causes, not just the surface."
-    ),
-    "comprehensiveness": (
-        "Reflect on Comprehensiveness: Are you missing critical perspectives? "
-        "State how this moment appears from the opposing cultural frame."
-    ),
-    "logic": (
-        "Reflect on Logic: Is this a valid deductive step? "
-        "Verify that the observations actually imply this result."
-    ),
-    "fairness": (
-        "Reflect on Fairness: Have all viewpoints been treated in a balanced way? "
-        "Audit for bias or quietly altered details that favor one frame."
-    ),
-}
-
-
-# Refinement retry cap. Nearly every cell fails self-validation at least once
-# (reflection_flags are almost always populated), so each attempt is an extra
-# LLM call per cell — this is the single biggest cost/latency multiplier.
-# Tune down via env for fast runs.
+# Refinement retry cap. Retries fire only on structural defects (empty or
+# too-short content), which are rare — reflection_flags are telemetry, not
+# failures, so they never trigger a retry. Tune via env if needed.
 MAX_REFINE_ATTEMPTS = int(os.environ.get("THIRDSPACE_REFINE_ATTEMPTS", "2"))
+
+
+def _structural_issues(result: dict) -> list[str]:
+    """Objective defects that justify paying for a retry call.
+
+    Deliberately narrow: an honest model asked to self-criticize will always
+    find something, so populated reflection_flags are NOT treated as failures
+    (run-june-10-1: 126/126 cells retried on their own honesty, 49% of the
+    run's calls, and 155 cells still carried flags afterwards). Flags are kept
+    on the result as downstream context instead.
+    """
+    content = str(result.get("content", "") or "").strip()
+    if not content:
+        return ["The 'content' field is empty. Write 3 to 6 sentences."]
+    sentence_count = _count_sentences(content)
+    if sentence_count < 3:
+        return [
+            f"Content has only {sentence_count} sentence(s). "
+            f"Write at least 3 sentences."
+        ]
+    return []
 
 
 @traceable(run_type="chain", name="cell_refinement")
@@ -377,17 +359,19 @@ def call_llm_json_with_refinement(
     **kwargs,
 ) -> Any:
     """
-    Wraps call_llm_json with a validation and self-correction loop.
+    Wraps call_llm_json with a structural validation and retry loop.
 
     Used for single-cell calls (CT agent and Challenger).
     Each call returns {"content": "...", "reflection_flags": [...], ...}.
 
-    Checks:
-    - content exists and has at least 3 sentences
-    - reflection_flags are addressed with corrective prompts on retry
+    Retries ONLY on objective structural defects (empty / too-short content —
+    see _structural_issues). reflection_flags are self-reported nuance, not
+    defects: they stay on the result untouched and never trigger a retry.
 
-    If validation passes, returns immediately. If it fails, injects specific
-    corrective feedback and retries up to max_refine_attempts times.
+    The retry prompt is context-complete: it contains the ORIGINAL user prompt
+    (The Occurring etc.), the model's previous response, and the feedback —
+    a bare "fix it" retry regenerates from the system prompt alone, with no
+    scenario in front of the model.
 
     The returned dict has an extra non-LLM key `_refinement_meta` with:
       {"attempts": int, "reasons": list[str]}
@@ -406,57 +390,34 @@ def call_llm_json_with_refinement(
     attempts = 0
     reasons: list[str] = []
 
-    for attempt in range(max_refine_attempts):
-        issues = []
-
-        content = result.get("content", "").strip()
-        if not content:
-            issues.append("The 'content' field is empty. Write 3 to 6 sentences.")
-        else:
-            sentence_count = _count_sentences(content)
-            if sentence_count < 3:
-                issues.append(
-                    f"Content has only {sentence_count} sentence(s). "
-                    f"Write at least 3 sentences."
-                )
-
-        for flag in result.get("reflection_flags", []):
-            if isinstance(flag, dict):
-                measure = flag.get("measure", "").lower().strip()
-                issue = flag.get("issue", "Unspecified failure")
-                instruction = REFLECTION_INSTRUCTIONS.get(
-                    measure,
-                    "Review the depth, fairness, and structural validity of this entry.",
-                )
-                issues.append(
-                    f"Self-evaluation failed [{measure.upper()}]: {issue}\n"
-                    f"Correction required: {instruction}"
-                )
-
+    for _ in range(max_refine_attempts):
+        issues = _structural_issues(result)
         if not issues:
-            result["_refinement_meta"] = {"attempts": attempts, "reasons": reasons}
-            return result
+            break
 
         attempts += 1
-        # Capture short, structured reasons for telemetry (the full prompt
-        # feedback is too verbose to persist on every cell).
-        for issue in issues:
-            first_line = issue.splitlines()[0]
-            reasons.append(first_line)
-
+        reasons.extend(issues)
         logger.warning(
-            f"[Refinement attempt {attempt + 1}] {len(issues)} issue(s) found, retrying."
+            f"[Refinement attempt {attempts}] {len(issues)} structural issue(s), retrying."
         )
-        feedback = "\n".join(issues[:5])
-        if len(issues) > 5:
-            feedback += f"\n...and {len(issues) - 5} more."
+        feedback = "\n".join(issues)
 
         refine_user = (
-            f"Your previous response failed validation:\n\n{feedback}\n\n"
-            f"Correct your response. Apply the correction directives above. "
-            f"Write 3 to 6 sentences. Return valid JSON."
+            f"{user}\n\n"
+            f"--- YOUR PREVIOUS RESPONSE ---\n"
+            f"{json.dumps(result, ensure_ascii=False)}\n\n"
+            f"--- VALIDATION FEEDBACK ---\n"
+            f"{feedback}\n\n"
+            f"Rewrite your previous response so it fixes the feedback while "
+            f"keeping everything that was already correct. Write 3 to 6 "
+            f"sentences. Return valid JSON in the same format."
         )
         result = call_llm_json(system, refine_user, **kwargs)
+        if not isinstance(result, dict):
+            raise ValueError(
+                f"call_llm_json_with_refinement expects a JSON object but got "
+                f"{type(result).__name__}: {str(result)[:200]}"
+            )
 
     result["_refinement_meta"] = {"attempts": attempts, "reasons": reasons}
     return result

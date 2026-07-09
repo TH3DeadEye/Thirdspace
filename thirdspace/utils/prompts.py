@@ -386,6 +386,10 @@ THE MOST IMPORTANT MOVE:
 
 {naming_block}
 
+SELF-CHECK before writing. Record failures in reflection_flags:
+  clarity, correctness, precision, proportion, depth,
+  comprehensiveness, logic, fairness
+
 Write 3 to 6 sentences. {consistency}Be specific to
 THIS facet and THIS dimension only.
 
@@ -393,8 +397,11 @@ Respond ONLY with valid JSON. No preamble. No markdown fences.
 Return:
 {{
   "content": "<your reasoning — 3 to 6 sentences>",
-  "reflection_flags": []
+  "reflection_flags": [
+    {{"measure": "<name>", "issue": "<what failed>"}}
+  ]
 }}
+reflection_flags is [] if all checks pass.
 """
     return decorate(base, RED_TEAM)
 
