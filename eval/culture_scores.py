@@ -119,6 +119,63 @@ def resolve_country(
     return scores.get(norm)
 
 
+def most_distant_country(
+    name: str,
+    scores: dict[str, dict[str, float]],
+    min_shared: int = 2,
+) -> tuple[str, float, int] | None:
+    """The Hofstede-furthest country from `name` — the challenger's frame.
+
+    NormAd supplies ONE country per row, but the design needs two contrasting
+    frames: the main agent reasons from the source culture, the challenger from
+    a culturally distant one, and their divergence is the signal that a norm is
+    operative. With no second country in the data, it has to be derived.
+
+    Hofstede coverage is uneven — only 65 of 111 countries carry all six
+    dimensions (Egypt, for instance, has two). Requiring all six would silently
+    drop ~40% of NormAd, so distance is computed over the dimensions the two
+    countries SHARE, and normalized by sqrt(n) so a 3-dimension distance is
+    comparable to a 6-dimension one.
+
+    Returns (country, normalized_distance, n_shared_dimensions), or None when
+    the source country is absent from the table or shares too few dimensions
+    with any candidate. n_shared is returned rather than used as a filter: a
+    pairing derived from 2 dimensions is weaker evidence than one from 6, and
+    that is the runner's call to make, not the builder's.
+
+    PRE-REGISTRATION NOTE: "maximally distant" is a deliberate choice, frozen in
+    eval/label_maps/normad_v1.yaml. It may make divergence too easy to detect —
+    a mid-distance country would be a harder test. Do not switch after seeing
+    scores; create a v2 map and re-run.
+    """
+    src = resolve_country(name, scores)
+    if src is None:
+        return None
+    src_dims = [c for c in HOFSTEDE_TO_MENU if c in src]
+    if len(src_dims) < min_shared:
+        return None
+    src_norm = COUNTRY_ALIASES.get(normalize_country(name), normalize_country(name))
+
+    # Rank lexicographically: MOST shared dimensions first, then greatest
+    # distance within that tier. Distance alone would be wrong — normalizing by
+    # sqrt(n) leaves few-dimension comparisons noisier, so a plain argmax
+    # systematically picks the least-informed pairing (observed: a 6-dimension
+    # country being matched through a 2-dimension distance). Comparing on as
+    # much evidence as exists, and only then maximizing, avoids that.
+    best: tuple[str, float, int] | None = None
+    for other, other_dims in scores.items():
+        if other == src_norm:
+            continue
+        shared = [d for d in src_dims if d in other_dims]
+        if len(shared) < min_shared:
+            continue
+        # Normalized (RMS) so tiers with different dimension counts stay readable.
+        distance = (sum((src[d] - other_dims[d]) ** 2 for d in shared) / len(shared)) ** 0.5
+        if best is None or (len(shared), distance) > (best[2], best[1]):
+            best = (other, distance, len(shared))
+    return best
+
+
 def country_to_axes(
     name: str,
     scores: dict[str, dict[str, float]],

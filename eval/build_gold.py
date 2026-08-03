@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from eval import DATA_DIR, GOLD_DIR, LABEL_MAPS_DIR  # noqa: E402
 from eval.culture_scores import (  # noqa: E402
     load_hofstede, load_wvs_axes, compute_medians, country_to_axes,
-    resolve_country, normalize_country,
+    resolve_country, normalize_country, most_distant_country,
 )
 
 NORMAD_FILE = DATA_DIR / "normad_etiquette.csv"
@@ -70,6 +70,8 @@ def main() -> None:
     unmatched_countries: Counter[str] = Counter()
     unmapped_labels: Counter[str] = Counter()
     label_counts: Counter[str] = Counter()
+    unpaired_countries: Counter[str] = Counter()
+    pairings: Counter[str] = Counter()
 
     with NORMAD_FILE.open(encoding="utf-8-sig") as f, \
          GOLD_FILE.open("w", encoding="utf-8") as out:
@@ -85,10 +87,25 @@ def main() -> None:
             if axes is None:
                 unmatched_countries[country] += 1
 
+            # The challenger's contrasting frame. NormAd gives one country; the
+            # pipeline needs two frames whose divergence signals that a norm is
+            # operative, so the distant pole is derived from Hofstede distance
+            # and cached here (build_gold is the only place it is computed, so
+            # every runner scores against the same pairing).
+            distant = most_distant_country(country, hofstede)
+            if distant is None:
+                unpaired_countries[country] += 1
+
             wvs_row = wvs.get(normalize_country(country)) if wvs else None
             record = {
                 "id": row["ID"],
                 "country": country,
+                "challenger_country": distant[0] if distant else "",
+                "challenger_distance": round(distant[1], 1) if distant else None,
+                # How many Hofstede dimensions the pairing was computed on (max 6).
+                # A pairing from 2 dimensions is weaker evidence than one from 6;
+                # runners can filter on this rather than trusting all pairings equally.
+                "challenger_dimensions": distant[2] if distant else 0,
                 "story": row["Story"].strip(),
                 "rule_of_thumb": (row.get("Rule-of-Thumb") or "").strip(),
                 "axis": (row.get("Axis") or "").strip(),
@@ -103,11 +120,22 @@ def main() -> None:
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
             records += 1
             label_counts[gold_label] += 1
+            if distant:
+                pairings[f"{normalize_country(country)} -> {distant[0]}"] += 1
 
     print(f"Wrote {records} records to {GOLD_FILE}")
     print(f"Gold label distribution: {dict(label_counts)}")
     covered = records - sum(unmatched_countries.values())
     print(f"Hofstede frame coverage: {covered}/{records} records")
+    paired = records - sum(unpaired_countries.values())
+    print(f"Challenger frame derived:  {paired}/{records} records")
+    if pairings:
+        print("Most common source -> challenger pairings:")
+        for pair, n in pairings.most_common(5):
+            print(f"  {pair}: {n} records")
+    if unpaired_countries:
+        print(f"Countries with no derivable challenger frame: "
+              f"{dict(unpaired_countries.most_common(5))}")
     if unmatched_countries:
         print(
             "Countries without a Hofstede match "
