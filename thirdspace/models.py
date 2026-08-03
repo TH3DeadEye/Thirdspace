@@ -357,6 +357,7 @@ class NodeReasoningGrid(BaseModel):
 
 #MEDIATION reasoning 
 class CellConflict(BaseModel):
+    cell_id: str = ""
     facet: Facet
     dimension: Dimension
     main_summary: str          # keep SHORT — a reference, not a restatement
@@ -389,31 +390,51 @@ class CellConflict(BaseModel):
 
     @model_validator(mode="after")
     def consistency(self) -> "CellConflict":
+        if not self.cell_id:
+            self.cell_id = f"{self.facet}/{self.dimension}"
         if self.resolvability not in get_allowed_resolvabilities(self.conflict_type):
             raise ValueError(f"{self.resolvability!r} not allowed for {self.conflict_type!r}")
         if self.is_semantic_subtype and self.conflict_type != ConflictType.INTERPRETIVE:
             raise ValueError("is_semantic_subtype is only valid for interpretive conflicts")
         return self
 
+class WholenessEntry(BaseModel):
+    """A mediator finding plus the conflict ids it was derived from.
+
+    refs are what make an unsupported finding *detectable*: a fabricated claim
+    usually carries fabricated refs, so run_mediation can drop entries citing
+    ids that don't exist. With plain strings, a hallucinated finding and a real
+    one are indistinguishable.
+    """
+    statement:str
+    refs: list[str] = []
 
 class WholenessImplyingNodes(BaseModel):
     """Mediator's constraining context for the next cycle (design 'Wholeness schema').
-    Flat — no main/challenger split (the challenger now sees the whole grid).
-    COORDINATE these field names with Omid's mediation prompt so it emits them 1:1."""
-    what_conflicts_imply: list[str] = []      # root pattern across conflict cells
-    updated_assumptions: list[str] = []       # assumptions to revise in The Occurring
-    comparison_assumptions: list[str] = []    # visible only by comparing main vs challenger
-    reformulated_queries: list[str] = []      # clearer next-cycle questions
-    new_objectives: list[str] = []            # revised reasoning goals
-    updated_perspectives: list[str] = []      # revised interpretive lenses
+    Flat — no main/challenger split. Field names must match Omid's mediation prompt 1:1."""
+    what_conflicts_imply: list[WholenessEntry] = []      # root pattern across conflicts
+    updated_assumptions: list[WholenessEntry] = []       # assumptions to revise in The Occurring
+    comparison_assumptions: list[WholenessEntry] = []    # visible only by comparing the two readings
+    reformulated_queries: list[WholenessEntry] = []      # clearer next-cycle questions
+    new_objectives: list[WholenessEntry] = []            # revised reasoning goals
+    updated_perspectives: list[WholenessEntry] = []      # revised interpretive lenses
+
+    def has_signal(self) -> bool:
+        """True when the mediator produced anything actionable for the next cycle."""
+        return any([self.what_conflicts_imply, self.updated_assumptions,
+                    self.comparison_assumptions, self.reformulated_queries,
+                    self.new_objectives, self.updated_perspectives])
 
 
 class ImplyingNodes(BaseModel):
     cycle: int
-    agreements: list[str]
+    agreements: list[WholenessEntry]
     conflicts: list[CellConflict]
     wholeness: WholenessImplyingNodes
     converged: bool
+    # Prior-cycle findings that still hold, cited by id rather than rewritten.
+    # Convergence measures what's NEW, so carried findings must not inflate it.
+    carried_forward: list[str] = []
     conflict_type_summary: ConflictTypeSummary | None = None
 
     @model_validator(mode="after")
@@ -422,18 +443,25 @@ class ImplyingNodes(BaseModel):
             self.conflicts, scope="cycle", cycles_included=[self.cycle])
         return self
 
+    @property
+    def conflict_ids(self) -> set[str]:
+        """Valid targets for a wholeness ref — used to catch invented citations."""
+        return {c.cell_id or f"{c.facet}/{c.dimension}" for c in self.conflicts}
+
     def to_context(self, cycle: int) -> dict | None:
-        """One constraining-context payload fed to BOTH agents in the next cycle
-        (design: no main/challenger split; the challenger sees the full grid)."""
+        """One constraining-context payload fed to BOTH agents in the next cycle."""
         w = self.wholeness
-        guidance = {k: v for k, v in {
-            "what_conflicts_imply": w.what_conflicts_imply,
-            "updated_assumptions": w.updated_assumptions,
-            "comparison_assumptions": w.comparison_assumptions,
-            "reformulated_queries": w.reformulated_queries,
-            "new_objectives": w.new_objectives,
-            "updated_perspectives": w.updated_perspectives,
-        }.items() if v}
+        guidance = {
+            k: [e.model_dump(mode="json") for e in v]
+            for k, v in {
+                "what_conflicts_imply": w.what_conflicts_imply,
+                "updated_assumptions": w.updated_assumptions,
+                "comparison_assumptions": w.comparison_assumptions,
+                "reformulated_queries": w.reformulated_queries,
+                "new_objectives": w.new_objectives,
+                "updated_perspectives": w.updated_perspectives,
+            }.items() if v
+        }
         if not guidance:
             return None
         return {"from_cycle": cycle, "guidance": guidance,
@@ -543,13 +571,15 @@ class CompressedHistoryEntry(BaseModel):
                                     if m.conflict_type_summary else None),
             agreement_count=len(m.agreements),
             conflict_count=len(m.conflicts),
-            key_agreements=m.agreements[:3],
+            key_agreements=[e.statement for e in m.agreements[:3]],
             key_conflicts=[c.implication for c in m.conflicts if c.severity >= 3][:5],
-            what_conflicts_imply=w.what_conflicts_imply,
-            reformulated_query=(w.reformulated_queries[0] if w.reformulated_queries else None),
-            new_objective=(w.new_objectives[0] if w.new_objectives else None),
+            what_conflicts_imply=[e.statement for e in w.what_conflicts_imply],
+            reformulated_query=(w.reformulated_queries[0].statement
+                                if w.reformulated_queries else None),
+            new_objective=(w.new_objectives[0].statement if w.new_objectives else None),
             converged=m.converged,
         )
+
 
 
 class SessionMemory(BaseModel):
