@@ -34,10 +34,12 @@ def conflict_signature(m: ImplyingNodes) -> str:
     """One string capturing the substance of a cycle's findings.
 
     Built from each conflict's `implication` (the "This reveals that..." insight)
-    plus the pattern-level `what_conflicts_imply`. Empty parts are skipped so a
-    cycle with no conflicts yields "" (which short-circuits the similarity).
+    plus the pattern-level `what_conflicts_imply`, which now lives on wholeness
+    as WholenessEntry objects. Empty parts are skipped so a cycle with no
+    conflicts yields "" (which short-circuits the similarity).
     """
-    parts = [c.implication for c in m.conflicts] + list(m.what_conflicts_imply)
+    parts = [c.implication for c in m.conflicts]
+    parts += [e.statement for e in m.wholeness.what_conflicts_imply]
     return "\n".join(p for p in parts if p and p.strip())
 
 
@@ -110,3 +112,31 @@ def type_distribution_stable(
         for t in set(prev_dist) | set(curr_dist)
     )
     return drift <= tolerance
+
+
+def conflicts_stable(prev: ImplyingNodes, curr: ImplyingNodes) -> tuple[bool, str]:
+    """The design's convergence conditions (b) and (c), verified in code.
+
+        (b) no new (facet, dimension) conflict appeared
+        (c) no conflict that persisted changed its type
+
+    The mediation prompt states this rule, but a self-reported `converged` flag
+    has been observed to fail in both directions, so the loop checks it rather
+    than trusting it. Returns (stable, reason) so the caller can log WHY a cycle
+    was or was not stable — a run's termination should be auditable afterwards.
+    """
+    prev_map = {(str(c.facet), str(c.dimension)): str(c.conflict_type) for c in prev.conflicts}
+    curr_map = {(str(c.facet), str(c.dimension)): str(c.conflict_type) for c in curr.conflicts}
+
+    new_cells = set(curr_map) - set(prev_map)
+    if new_cells:
+        return False, (f"{len(new_cells)} new conflict cell(s): "
+                       f"{sorted('/'.join(c) for c in new_cells)[:3]}")
+
+    shifted = [cell for cell in set(prev_map) & set(curr_map)
+               if prev_map[cell] != curr_map[cell]]
+    if shifted:
+        cell = shifted[0]
+        return False, (f"{len(shifted)} conflict(s) changed type, e.g. "
+                       f"{'/'.join(cell)}: {prev_map[cell]} -> {curr_map[cell]}")
+    return True, "no new cells, no type shifts"

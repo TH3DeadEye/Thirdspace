@@ -18,7 +18,6 @@ from models import (
     ConflictTypeSummary, CompressedHistoryEntry,
     FACET_LIST, DIMENSION_LIST, NUM_FACET, NUM_CELLS,
     CulturalFrame, CulturalIdentity, WorkingPerspective, CultureAxis,
-    CONFLICT_TYPE_DEFS,
 )
 from llm import call_llm, call_llm_json, call_llm_json_with_refinement, CHALLENGER_MODEL_ID
 from budget import active_memory, get_active_memory

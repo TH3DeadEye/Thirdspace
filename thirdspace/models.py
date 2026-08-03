@@ -604,8 +604,13 @@ class SessionMemory(BaseModel):
     challenger_grids: list[NodeReasoningGrid] = []
     mediation_history: list[ImplyingNodes] = []
     compressed_history: list[CompressedHistoryEntry] = []
-    current_cycle: int = 0
-    max_cycles: int = 3 
+    current_cycle: int = 1          # cycles are 1-indexed (prompts.py guards assume it)
+    max_cycles: int = 3
+    # Stop after the loop instead of writing the final document. The
+    # convergence-based (NormAd) and dominant-type (MDD) classifiers read the
+    # mediation output, not the prose, so an evaluation run that does not need
+    # the document should not pay for it. Persisted so a run records what it did.
+    skip_generation: bool = False
     convergence_metric: Literal["jaccard", "embedding"] = "embedding"
     jaccard_convergence_threshold: float = 0.7
     embedding_convergence_threshold: float = 0.85
