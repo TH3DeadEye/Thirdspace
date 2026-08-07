@@ -39,5 +39,53 @@ prediction_classes: [adhere, violate, neither]
 notes: |
   This mapping is 1:1 (lossless): NormAd's own label scheme is already the
   ternary judgment the ablation needs, so no lossy projection onto the
-  five-type conflict taxonomy is involved. Contrast with aita_v1.yaml, where
-  the mapping IS lossy and each decision carries a rationale.
+  conflict taxonomy is involved.
+
+# ---------------------------------------------------------------------------
+# Challenger frame derivation — FROZEN, added before any scoring run
+# ---------------------------------------------------------------------------
+# NormAd supplies ONE country per row, but the pipeline needs two contrasting
+# frames: the main agent reasons from the source culture, the challenger from a
+# culturally distant one, and their DIVERGENCE is the signal that a norm is
+# operative. Without a second frame there is no divergence and the whole
+# convergence-based classification collapses, so the distant pole is derived.
+challenger_frame:
+  method: hofstede_max_distance
+  implementation: eval/culture_scores.py::most_distant_country
+  ranking: |
+    Candidates are ranked by (number of shared Hofstede dimensions, then
+    distance). Distance alone is wrong: normalizing by sqrt(n) leaves
+    few-dimension comparisons noisier, so a plain argmax systematically selects
+    the LEAST-informed pairing — observed producing zero full-6 pairings, with
+    Germany matched through a 2-dimension distance.
+  distance: "RMS over shared dimensions, i.e. sqrt(sum((a-b)^2)/n)"
+  min_shared_dimensions: 2
+  recorded_fields: [challenger_country, challenger_distance, challenger_dimensions]
+  caveat: |
+    "Maximally distant" is a deliberate choice. It may make divergence too easy
+    to detect; a mid-distance country would be a harder test. Do not switch
+    after seeing scores — create normad_v2.yaml and re-run.
+
+# ---------------------------------------------------------------------------
+# Eligibility — FROZEN before any scoring run
+# ---------------------------------------------------------------------------
+# Records are written to the gold file either way, carrying `eligible` and
+# `exclusion_reason`, so the exclusion is auditable. Runners score only
+# eligible records.
+eligibility:
+  require_challenger_frame: true
+  rationale: |
+    740 of 2,633 records name a country absent from the Hofstede table (sudan,
+    somalia, myanmar, ethiopia, afghanistan, ...), so no contrasting frame can
+    be derived and the challenger would run neutral — no frame contrast, no
+    divergence signal, nothing for the convergence mechanism to read.
+
+    Excluding them leaves n=1,893. Their label split (268 adhere / 246 violate /
+    226 neither) is close to proportional to the full set, so this costs sample
+    size WITHOUT biasing the label distribution — the remaining set is
+    675/629/589, still balanced.
+  known_limitations: |
+    The excluded countries are concentrated in Africa, South Asia and the Pacific,
+    because that is where Hofstede coverage is thinnest. The cultural arm is
+    therefore evaluated on a geographically narrower set than NormAd covers, and
+    results should not be described as spanning all 75 countries.

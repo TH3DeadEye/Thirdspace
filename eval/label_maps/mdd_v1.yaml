@@ -37,13 +37,57 @@ class_balance:
 majority_baseline_accuracy: 0.59
 
 # ---------------------------------------------------------------------------
-# 2. Frames — which record fields become each agent's cultural frame
+# 2. Frames — how each agent's frame is composed
 # ---------------------------------------------------------------------------
-# Mirrors prompts.FRAME_FIELDS["moral_decision"]. The two parties to the moral
-# situation ARE the two frames: the one who acted and the one acted upon.
+# The two parties to the moral situation ARE the two frames: the one who acted
+# and the one acted upon.
+#
+# The raw columns hold bare NAMES ("Alice", "Doris", "Husband") — a median of
+# 20 characters across both sides. A frame of "Alice" tells an agent nothing
+# about how to reason, so both sides would produce near-identical readings and
+# no divergence would appear. The frame is therefore COMPOSED from the agent,
+# their relation to the action, and the ethics domain.
+#
+# EXCLUDED from the composition on purpose: Ethical Principles Upheld/Violated,
+# Severity, Utility, Duration, Moral Intention. Each correlates with the verdict,
+# so putting them in the frame would leak the answer into the input — the same
+# trap as NormAd's Rule-of-Thumb.
 frames:
-  main: "Passive Agent"       # the party acted upon
-  challenger: "Active Agent"  # the party who acted
+  main:
+    agent_column: "Passive Agent"     # the party acted upon
+    template: "{agent} — the party affected by: {action}.{domain_clause}"
+  challenger:
+    agent_column: "Active Agent"      # the party who acted
+    template: "{agent} — the party who carried out: {action}.{domain_clause}"
+  domain_clause: " Domain: {domain}."
+  composed_from: ["Active Agent", "Passive Agent", "Action", "Domain"]
+  deliberately_excluded:
+    - "Ethical Principles Upheld"
+    - "Ethical Principles Violated"
+    - "Severity of Consequence"
+    - "Utility of Consequence"
+    - "Duration of Consequence"
+    - "Moral Intention"
+
+# ---------------------------------------------------------------------------
+# 2b. Eligibility — FROZEN before any scoring run
+# ---------------------------------------------------------------------------
+# Records are written to the gold file either way, carrying `eligible` and
+# `exclusion_reason`, so the exclusion is auditable rather than invisible.
+# Runners score only eligible records.
+eligibility:
+  min_input_chars: 200
+  rationale: |
+    24 of 100 cases have an input under 200 characters (minimum 55). A 55-char
+    input cannot support a 30-cell decomposition — the grid would pad, and those
+    cells would be noise scored as if they were reasoning. Excluding them leaves
+    n=76.
+  known_limitations: |
+    - Only 6 morally_right examples in the full set. Macro-F1 averages per class,
+      so that class is computed from a handful of items and one error swings it
+      heavily. Always report macro-F1 with n per class, or a confidence interval.
+    - 63 of 100 cases are "Legal Ethics" out of 13 domains. Per-domain breakdowns
+      will be too thin to interpret; report overall and treat domain as context.
 
 # ---------------------------------------------------------------------------
 # 3. Dominant conflict type -> predicted label

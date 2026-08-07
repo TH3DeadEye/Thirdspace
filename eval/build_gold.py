@@ -72,6 +72,7 @@ def main() -> None:
     label_counts: Counter[str] = Counter()
     unpaired_countries: Counter[str] = Counter()
     pairings: Counter[str] = Counter()
+    eligible_labels: Counter[str] = Counter()
 
     with NORMAD_FILE.open(encoding="utf-8-sig") as f, \
          GOLD_FILE.open("w", encoding="utf-8") as out:
@@ -106,6 +107,14 @@ def main() -> None:
                 # A pairing from 2 dimensions is weaker evidence than one from 6;
                 # runners can filter on this rather than trusting all pairings equally.
                 "challenger_dimensions": distant[2] if distant else 0,
+                # Eligibility is recorded, not enforced: the record is written
+                # either way so the exclusion stays auditable, and runners
+                # filter on `eligible`. FROZEN in normad_v1.yaml.
+                "eligible": distant is not None,
+                "exclusion_reason": (
+                    "" if distant is not None
+                    else "no challenger frame: country absent from the Hofstede table"
+                ),
                 "story": row["Story"].strip(),
                 "rule_of_thumb": (row.get("Rule-of-Thumb") or "").strip(),
                 "axis": (row.get("Axis") or "").strip(),
@@ -122,13 +131,17 @@ def main() -> None:
             label_counts[gold_label] += 1
             if distant:
                 pairings[f"{normalize_country(country)} -> {distant[0]}"] += 1
+                eligible_labels[gold_label] += 1
 
     print(f"Wrote {records} records to {GOLD_FILE}")
     print(f"Gold label distribution: {dict(label_counts)}")
     covered = records - sum(unmatched_countries.values())
     print(f"Hofstede frame coverage: {covered}/{records} records")
     paired = records - sum(unpaired_countries.values())
-    print(f"Challenger frame derived:  {paired}/{records} records")
+    print(f"ELIGIBLE for scoring: {paired}/{records} "
+          f"(excluded {records - paired} with no derivable challenger frame)")
+    if paired:
+        print(f"Gold label distribution (eligible): {dict(eligible_labels)}")
     if pairings:
         print("Most common source -> challenger pairings:")
         for pair, n in pairings.most_common(5):
