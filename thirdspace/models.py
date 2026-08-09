@@ -610,7 +610,7 @@ class SessionMemory(BaseModel):
     # convergence-based (NormAd) and dominant-type (MDD) classifiers read the
     # mediation output, not the prose, so an evaluation run that does not need
     # the document should not pay for it. Persisted so a run records what it did.
-    skip_generation: bool = False
+    skip_generation: bool = True 
     convergence_metric: Literal["jaccard", "embedding"] = "embedding"
     jaccard_convergence_threshold: float = 0.7
     embedding_convergence_threshold: float = 0.85
