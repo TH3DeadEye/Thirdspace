@@ -19,7 +19,7 @@ from budget import (
 from utils.parsing import _candidate_blocks, _count_sentences
 
 logger = logging.getLogger(__name__)
-#main agent LLM model. 
+#main agent LLM model.. 
 BEDROCK_MODEL_ID = os.environ.get(
     "BEDROCK_MODEL_ID",
     
