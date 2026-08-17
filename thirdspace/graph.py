@@ -136,12 +136,16 @@ def node_integrate(state: GraphState) -> GraphState:
     # schema; it is applied to the challenger because that is the only side
     # carrying a WorkingPerspective. Revisit if the main agent needs one too.
     if changed and mediation.wholeness.updated_perspectives:
-        prose = mediation.wholeness.updated_perspectives[0].statement
-        mem.challenger_working_perspective = WorkingPerspective(
-            cycle_last_updated=mediation.cycle, prose=prose
-        )
-        logger.info(f"[{mem.scenario_id}] challenger working perspective updated "
-                    f"(identity preserved: {mem.challenger_identity.render()[:50]})")
+        if mediation.wholeness.updated_perspectives:
+            prose = mediation.wholeness.updated_perspectives[0].statement
+            mem.active_challenger_perspective = prose
+
+        #prose = mediation.wholeness.updated_perspectives[0].statement
+            mem.challenger_working_perspective = WorkingPerspective(
+                cycle_last_updated=mediation.cycle, prose=prose
+            )
+            logger.info(f"[{mem.scenario_id}] challenger working perspective updated "
+                        f"(identity preserved: {mem.challenger_identity.render()[:50]})")
 
     mem.current_cycle += 1
     return {"memory": mem}
