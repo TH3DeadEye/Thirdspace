@@ -96,6 +96,11 @@ def call_llm_json(system: str, user: str, **kwargs) -> Any:
         raise ValueError(f"Model response was not valid JSON: {e}") from e
 
 
+
+
+### according to the  the third space folder. the following piecesof codes  are stale and broken.  
+
+
 # PHASE 1 — REFORMULATION
 
 REFORMULATION_SYSTEM = """\
