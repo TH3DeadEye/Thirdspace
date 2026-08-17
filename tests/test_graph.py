@@ -317,6 +317,7 @@ class TestEmbeddingConvergence(unittest.TestCase):
             cultural_insight=5, intervention_fidelity=5, reasoning="cycle ok",
         )
         g_module.run_node_update = _stub_node_update
+        #need to rewrite this judge in future for other objectives
         g_module.run_judge = lambda final_output, mediation_history, cycle: JudgeScore(
             cycle=cycle, empathy=5, consensus=5, escalation_risk=2,
             cultural_insight=5, intervention_fidelity=5, reasoning="output judge",
