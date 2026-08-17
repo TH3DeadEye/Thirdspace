@@ -248,8 +248,8 @@ class OccurringNode(BaseModel):
 def _content_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a.strip(), b.strip()).ratio()
 
-def _truncate_content(text: str, limit: int = 380) -> str:
-    if len(text) <= limit:
+def _truncate_content(text: str, limit: int = 380, disable=False) -> str:
+    if disable or len(text) <= limit:
         return text
     cut = text[:limit]
     last_space = cut.rfind(" ")

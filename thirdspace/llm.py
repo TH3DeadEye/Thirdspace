@@ -19,7 +19,7 @@ from budget import (
 from utils.parsing import _candidate_blocks, _count_sentences
 
 logger = logging.getLogger(__name__)
-#main agent LLM model.. 
+#main agent LLM model 
 BEDROCK_MODEL_ID = os.environ.get(
     "BEDROCK_MODEL_ID",
     
@@ -409,7 +409,7 @@ def call_llm_json_with_refinement(
             f"--- VALIDATION FEEDBACK ---\n"
             f"{feedback}\n\n"
             f"Rewrite your previous response so it fixes the feedback while "
-            f"keeping everything that was already correct. Write 3 to 6 "
+            f"keeping everything that was already correct. Up to 6 "
             f"sentences. Return valid JSON in the same format."
         )
         result = call_llm_json(system, refine_user, **kwargs)
