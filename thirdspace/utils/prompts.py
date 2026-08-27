@@ -627,29 +627,40 @@ _RESOLVABILITY_TABLE = "\n".join(
 )
 
 _WHOLENESS_SPEC = """\
-  what_conflicts_imply   ALWAYS. The root pattern across multiple conflicts,
-                         what it says about the disagreement overall, and
-                         where mediation should focus next. Name competing
-                         moral commitments explicitly where conflicts are
-                         normative or identity_related.
-  updated_assumptions    ALWAYS. Format: "node: remove [exact text] →
-                         replace with [exact text]". Replace unsupported
-                         certainty with assumptions that carry the
-                         remaining uncertainty.
-  comparison_assumptions IF WARRANTED. Premises visible only by comparing A
-                         against B. Skip where an explicit stated
-                         disagreement already explains the divergence.
-  reformulated_queries   IF WARRANTED. Only where the current question is
-                         malformed, conflates facts with values or
-                         solutions, or is unanswerable as posed. Decompose
-                         into empirical, interpretive, normative, or
-                         procedural sub-questions.
-  new_objectives         ONLY ON CAUSE. Only where the original objective is
-                         premature, misaligned, or rests on an assumption
-                         you just revised.
-  updated_perspectives   ONLY ON CAUSE. Only where specific overlooked
-                         evidence, stakeholders, or context require a
-                         revised lens. State its remaining uncertainty."""
+  what_conflicts_imply   ALWAYS. MANY allowed. The root pattern across
+                         multiple conflicts, what it says about the
+                         disagreement overall, and where mediation should
+                         focus next. Name competing moral commitments
+                         explicitly where conflicts are normative or
+                         identity_related.
+  updated_assumptions    ALWAYS. MANY allowed. Format: "node: remove
+                         [exact text] → replace with [exact text]".
+                         Replace unsupported certainty with assumptions
+                         that carry the remaining uncertainty. One entry
+                         per assumption corrected.
+  comparison_assumptions IF WARRANTED. MANY allowed. Premises visible only
+                         by comparing A against B, not stated by either
+                         alone. Skip where an explicit stated disagreement
+                         already explains the divergence.
+  reformulated_queries   IF WARRANTED. AT MOST ONE. Only where the current
+                         question is malformed, conflates facts with
+                         values or solutions, or is unanswerable as
+                         posed. Decompose into empirical, interpretive,
+                         normative, or procedural sub-questions. If
+                         multiple reformulations seem possible, pick the
+                         single most load-bearing one — do not list
+                         alternatives.
+  new_objectives         ONLY ON CAUSE. AT MOST ONE. Only where the
+                         original objective is premature, misaligned, or
+                         rests on an assumption you just revised. State
+                         the cause inline. There is one active objective;
+                         do not propose competing candidates.
+  updated_perspectives   ONLY ON CAUSE. AT MOST ONE. Only where specific
+                         overlooked evidence, stakeholders, or context
+                         require a revised lens. State its remaining
+                         uncertainty. This becomes THE working
+                         perspective going forward — do not propose
+                         alternatives to choose between."""
 
 _MEDIATION_SYSTEM_BODY = f"""\
 You are the mediation engine in a cultural conflict analysis system.
