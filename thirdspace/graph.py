@@ -129,18 +129,26 @@ def node_integrate(state: GraphState) -> GraphState:
                if before.get(str(n.facet)) != n.content]
     logger.info(f"[{mem.scenario_id}] node update cycle {mediation.cycle}: changed={changed}")
 
-    # Refine the challenger's WORKING PERSPECTIVE (prose) only when something
-    # actually moved. The structured identity is never overwritten, so a
-    # dimensional frame cannot decay into free text across cycles.
+    # Refine the challenger's WORKING PERSPECTIVE. The structured identity is
+    # never overwritten, so a dimensional frame cannot decay into free text.
+    #
+    # Gated on updated_perspectives alone — NOT on `changed`. `changed` measures
+    # whether node CONTENT moved, so a cycle that revised only assumptions used to
+    # leave the perspective stale even though mediation had explicitly asked for a
+    # new lens. The field being non-empty is what licenses the update.
+    #
     # NOTE: wholeness.updated_perspectives is agent-agnostic in the current
     # schema; it is applied to the challenger because that is the only side
     # carrying a WorkingPerspective. Revisit if the main agent needs one too.
-    if changed and mediation.wholeness.updated_perspectives:
-        prose = mediation.wholeness.updated_perspectives[0].statement
-        mem.challenger_working_perspective = WorkingPerspective(
-            cycle_last_updated=mediation.cycle, prose=prose
+    perspectives = mediation.wholeness.updated_perspectives
+    if perspectives:
+        before = len(mem.challenger_working_perspective.entries)
+        mem.challenger_working_perspective = (
+            mem.challenger_working_perspective.with_updates(mediation.cycle, perspectives)
         )
-        logger.info(f"[{mem.scenario_id}] challenger working perspective updated "
+        added = len(mem.challenger_working_perspective.entries) - before
+        logger.info(f"[{mem.scenario_id}] challenger working perspective: +{added} "
+                    f"of {len(perspectives)} refinement(s) "
                     f"(identity preserved: {mem.challenger_identity.render()[:50]})")
 
     mem.current_cycle += 1
@@ -164,19 +172,63 @@ def node_generate(state: GraphState) -> GraphState:
 # Router
 # ---------------------------------------------------------------------------
 
-def should_loop(state: GraphState) -> str:
-    """Terminate, or run another cycle.
+def _measure_stability(mem) -> dict | None:
+    """Three cheap measures of whether the analysis has stopped moving.
 
-    The mediator's `converged` flag is ADVISORY IN BOTH DIRECTIONS. It has been
-    observed to fail each way: declaring convergence while the content was still
-    moving, and withholding it across cycles that produced identical conflict
-    profiles (burning a full extra cycle re-deriving the same findings).
-
-    So the loop verifies it, with three cheap measurements:
         similarity  - is the SUBSTANCE the same? (embedding cosine or Jaccard)
         type mix    - is the SHAPE of the disagreement the same?
         conflicts   - the design's own rule: no new (facet, dimension) cells,
                       and no conflict that changed type
+
+    Computed under BOTH cycle policies and appended to `stability_log`, so a
+    fixed-N run still yields the convergence data even though it does not route
+    on it. Returns None before cycle 2, when there is nothing to compare.
+
+    `similarity` is None when the embedding call fails. It must never raise from
+    here: this runs inside a LangGraph conditional edge, so an exception loses the
+    entire paid run instead of terminating cleanly with a persisted session.
+    """
+    history = mem.mediation_history
+    if len(history) < 2:
+        return None
+    prev, curr = history[-2], history[-1]
+    threshold = (mem.embedding_convergence_threshold
+                 if mem.convergence_metric == "embedding"
+                 else mem.jaccard_convergence_threshold)
+    try:
+        sim = convergence_similarity(prev, curr, mem.convergence_metric)
+    except Exception as exc:
+        logger.warning(f"[{mem.scenario_id}] convergence metric unavailable "
+                       f"({type(exc).__name__}: {exc}); treating as 'still moving'")
+        sim = None
+    stable_conflicts, why = conflicts_stable(prev, curr)
+    return {
+        "cycle": curr.cycle,
+        "metric": mem.convergence_metric,
+        "similarity": sim,
+        "threshold": threshold,
+        "types_stable": type_distribution_stable(prev, curr),
+        "conflicts_stable": stable_conflicts,
+        "conflicts_note": why,
+        "llm_converged": mem.converged,
+    }
+
+
+def should_loop(state: GraphState) -> str:
+    """Terminate, or run another cycle.
+
+    Two policies, selected by `mem.cycle_policy`:
+
+    "fixed" (default) — run exactly max_cycles. The convergence measures are
+    still taken every cycle and recorded on `stability_log`, they just do not
+    decide anything. This is the honest default: every eval path has always
+    passed max_cycles=1, so the convergence branch below had never once
+    executed. The policy was already fixed by accident; this states it.
+
+    "convergence" — the mediator's `converged` flag is ADVISORY IN BOTH
+    DIRECTIONS. It has been observed to fail each way: declaring convergence
+    while content was still moving, and withholding it across cycles that
+    produced identical conflict profiles (burning a full extra cycle).
 
         llm=True  + substance still moving   -> keep going (premature declaration)
         llm=False + all three stable         -> stop (structural_convergence)
@@ -185,9 +237,18 @@ def should_loop(state: GraphState) -> str:
     termination is auditable after the fact.
     """
     mem = state["memory"]
-    history = mem.mediation_history
-    # Where "stop" leads: the document, or straight out.
     done = "end" if mem.skip_generation else "generate"
+
+    stability = _measure_stability(mem)
+    if stability is not None:
+        mem.stability_log.append(stability)
+        sim = stability["similarity"]
+        logger.info(
+            f"[{mem.scenario_id}] cycle {mem.current_cycle} stability: "
+            f"{stability['metric']}={'n/a' if sim is None else format(sim, '.2f')}"
+            f"/{stability['threshold']}, types_stable={stability['types_stable']}, "
+            f"conflicts_stable={stability['conflicts_stable']} ({stability['conflicts_note']})"
+        )
 
     if mem.current_cycle >= mem.max_cycles:
         if not mem.converged:
@@ -195,25 +256,24 @@ def should_loop(state: GraphState) -> str:
         logger.info(f"[{mem.scenario_id}] max cycles ({mem.max_cycles}) reached")
         return done
 
-    if len(history) >= 2:
-        prev, curr = history[-2], history[-1]
-        sim = convergence_similarity(prev, curr, mem.convergence_metric)
-        threshold = (mem.embedding_convergence_threshold
-                     if mem.convergence_metric == "embedding"
-                     else mem.jaccard_convergence_threshold)
-        stable_types = type_distribution_stable(prev, curr)
-        stable_conflicts, why = conflicts_stable(prev, curr)
+    if mem.cycle_policy == "fixed":
+        logger.info(f"[{mem.scenario_id}] fixed policy; continuing to cycle "
+                    f"{mem.current_cycle + 1} of {mem.max_cycles}")
+        return "integrate"
 
-        logger.info(f"[{mem.scenario_id}] cycle {mem.current_cycle} stability: "
-                    f"{mem.convergence_metric}={sim:.2f}/{threshold}, "
-                    f"types_stable={stable_types}, conflicts_stable={stable_conflicts} ({why})")
+    if stability is not None:
+        sim, threshold = stability["similarity"], stability["threshold"]
+        # sim is None only when the metric was unavailable; treat that as "still
+        # moving" so an infrastructure failure can never manufacture convergence.
+        moving = sim is None or sim < threshold
 
-        if mem.converged and sim < threshold:
+        if mem.converged and moving:
             logger.info(f"[{mem.scenario_id}] mediator declared converged but content is "
-                        f"still moving ({sim:.2f} < {threshold}) — vetoing, continuing")
+                        f"still moving — vetoing, continuing")
             return "integrate"
 
-        if not mem.converged and sim >= threshold and stable_types and stable_conflicts:
+        if (not mem.converged and not moving
+                and stability["types_stable"] and stability["conflicts_stable"]):
             mem.converged = True
             mem.convergence_reason = "structural_convergence"
             logger.info(f"[{mem.scenario_id}] structural_convergence: all three measures "

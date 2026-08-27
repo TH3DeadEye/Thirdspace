@@ -1,15 +1,16 @@
-"""
-Prompt-hygiene regression tests for rubric leakage (TODO Step 2).
+"""The generated document must never carry the vocabulary that produced it.
 
-run-june-10-1's final document contained internal rubric text verbatim:
-"CRITICAL PROHIBITION: Do NOT offer dialogue...", "This is the false
-resolution trap.", and headers like "FOR STRUCTURAL CONFLICTS (16 conflicts,
-50% of total)". The generator parrots labeled rubric blocks, so the fix is to
-keep them out of the prompts entirely. models.LEAK_PHRASES is the shared
-banned-vocabulary list; the eval harness greps generated documents against it.
+A real run once emitted "CRITICAL PROHIBITION: Do NOT offer dialogue..." verbatim
+into the finished analysis, alongside internal headers and seven uses of the word
+"severity" — the two people in the conflict were handed the rubric. These tests
+pin the fix at the source: the intervention prose and the generation system
+prompt must both be free of rubric markers.
+
+models.LEAK_PHRASES is the shared list; the eval harness greps produced documents
+against the same constant, and verify_session asserts on it per run.
 """
+import re
 import sys
-import unittest
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -18,85 +19,74 @@ for p in (_ROOT, _ROOT / "thirdspace"):
         sys.path.insert(0, str(p))
 
 from models import (
-    INTERVENTION_CLASS, LEAK_PHRASES, ConflictTypeSummary,
+    CONFLICT_TYPE_DEFS, LEAK_PHRASES, ConflictTypeSummary, ConflictType,
 )
-from utils.prompts import build_constrained_generation_system
-from tests.test_graph import _conflict
+from utils import prompts
+from tests.fixtures import make_conflict
 
-
-# Rubric-block markers that must never appear in any prompt sent to the
-# generator. (A subset of LEAK_PHRASES: the full list includes words like
-# "severity" that the system prompt legitimately mentions when instructing the
-# model NOT to use them.)
+# Markers from the old labelled-block style. These are what leaked verbatim.
 RUBRIC_MARKERS = [
-    "intervention class",
-    "absolute prohibition",
-    "critical prohibition",
-    "false resolution trap",
-    "prohibited",
-    "══",
-    "──",
+    "INTERVENTION CLASS", "ABSOLUTE PROHIBITION", "CRITICAL PROHIBITION",
+    "FALSE RESOLUTION TRAP", "PROHIBITED:",
 ]
 
 
 def _full_summary() -> ConflictTypeSummary:
-    """A summary with every type present, structural fraction >= 0.30, and
-    unresolvable conflicts, so every conditional prompt block is exercised."""
     conflicts = [
-        _conflict("individuals", "assumptions", "structural"),
-        _conflict("individuals", "evidence", "structural"),
-        _conflict("concepts_theories_rules", "concepts", "structural"),
-        _conflict("process", "assumptions", "normative"),
-        _conflict("process", "evidence", "semantic"),
-        _conflict("inferences", "assumptions", "attributional"),
-        _conflict("inferences", "evidence", "factual"),
+        make_conflict("agents", "value", "power_related", "structural_change", 5),
+        make_conflict("actions", "constraint", "power_related", "structural_change", 4),
+        make_conflict("context", "interpretation", "interpretive", "conversational", 2),
+        make_conflict("representations", "assumption", "normative", "facilitated", 3),
     ]
-    # Mark one unresolvable so the unresolvable_note block renders too.
-    unresolvable = _conflict("evidence_and_data", "evidence", "factual")
-    unresolvable = unresolvable.model_copy(update={"resolvability": "unresolvable"})
-    return ConflictTypeSummary.from_conflicts(conflicts + [unresolvable])
+    return ConflictTypeSummary.from_conflicts(conflicts)
 
 
-class InterventionTextHygiene(unittest.TestCase):
+class TestInterventionTextHygiene:
     def test_intervention_texts_contain_no_leak_phrases(self):
-        for ctype, text in INTERVENTION_CLASS.items():
-            low = text.lower()
+        for ctype, defn in CONFLICT_TYPE_DEFS.items():
+            low = defn.intervention_text.lower()
             for phrase in LEAK_PHRASES:
-                self.assertNotIn(
-                    phrase, low,
-                    f"intervention_text for '{ctype}' contains banned phrase {phrase!r}",
-                )
+                assert phrase not in low, (
+                    f"intervention_text for {ctype!r} contains banned phrase {phrase!r}")
 
     def test_intervention_texts_are_prose_not_labeled_blocks(self):
-        for ctype, text in INTERVENTION_CLASS.items():
-            self.assertFalse(
-                text.strip().split("\n")[0].isupper(),
-                f"intervention_text for '{ctype}' starts with an ALL-CAPS label line",
-            )
+        for ctype, defn in CONFLICT_TYPE_DEFS.items():
+            first = defn.intervention_text.strip().splitlines()[0]
+            assert not re.match(r"^[A-Z][A-Z \-]{6,}:", first), (
+                f"intervention_text for {ctype!r} opens with an ALL-CAPS label line; "
+                f"the generator parrots these into the document")
+
+    def test_every_type_has_intervention_prose(self):
+        for ctype in ConflictType:
+            assert CONFLICT_TYPE_DEFS[ctype].intervention_text.strip()
 
 
-class GenerationSystemPromptHygiene(unittest.TestCase):
+class TestGenerationSystemPromptHygiene:
     def test_full_prompt_contains_no_rubric_markers(self):
-        prompt = build_constrained_generation_system(_full_summary())
-        low = prompt.lower()
+        system = prompts.build_constrained_generation_system(_full_summary(), 900)
         for marker in RUBRIC_MARKERS:
-            self.assertNotIn(marker, low, f"generation prompt contains {marker!r}")
+            assert marker not in system
+        low = system.lower()
+        for phrase in LEAK_PHRASES:
+            assert phrase not in low, f"generation prompt contains {phrase!r}"
 
     def test_empty_summary_prompt_contains_no_rubric_markers(self):
-        for summary in (None,):
-            prompt = build_constrained_generation_system(summary)
-            low = prompt.lower()
-            for marker in RUBRIC_MARKERS:
-                self.assertNotIn(marker, low, f"generation prompt contains {marker!r}")
+        system = prompts.build_constrained_generation_system(None, 900)
+        for marker in RUBRIC_MARKERS:
+            assert marker not in system
 
     def test_prompt_still_carries_the_substance(self):
-        """De-fanging must not delete the guidance itself: the structural
-        anti-dialogue rule and per-type paragraphs must survive as prose."""
-        prompt = build_constrained_generation_system(_full_summary())
-        self.assertIn("Do not present dialogue as", prompt)
-        self.assertIn("structural conflict", prompt)
-        self.assertIn("HOW TO MOVE FORWARD", prompt)
+        """Hygiene must not have hollowed the guidance out."""
+        system = prompts.build_constrained_generation_system(_full_summary(), 900)
+        assert "WHAT THIS SITUATION NEEDS" in system
+        assert "900" in system
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_multi_type_prompt_carries_each_present_type(self):
+        """Only the dominant type's remedy used to reach the prompt, so five of
+        the six interventions were unreachable in practice."""
+        system = prompts.build_constrained_generation_system(
+            None, 900, weighted_types=["power_related", "interpretive"])
+        assert "structural asymmetry" in system
+        assert "shared framework" in system
+        for marker in RUBRIC_MARKERS:
+            assert marker not in system

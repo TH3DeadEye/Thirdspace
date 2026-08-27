@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 #importing dependencies
-import difflib
 import json
 from collections import Counter
 from dataclasses import dataclass
@@ -245,26 +244,6 @@ class OccurringNode(BaseModel):
     last_updated_cycle:int = 0
 
 
-def _content_similarity(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, a.strip(), b.strip()).ratio()
-
-def _truncate_content(text: str, limit: int = 380) -> str:
-    if len(text) <= limit:
-        return text
-    cut = text[:limit]
-    last_space = cut.rfind(" ")
-    if last_space > 100:
-        cut = cut[:last_space]
-    return cut + "…"
-
-def _slim_budget_per_node(nodes: list["OccurringNode"], focus_facet: Facet,
-                          total_context_chars: int = 4000, focus_fraction: float = 0.5) -> dict[Facet, int]:
-    focus_budget = int(total_context_chars * focus_fraction)
-    n_others = len(nodes) - 1
-    other_budget = int((total_context_chars * (1 - focus_fraction)) / max(n_others, 1))
-    return {n.facet: focus_budget if n.facet == focus_facet else other_budget for n in nodes}
-
-
 class TheOccurring(BaseModel):
     scenario_id:str
     raw_scenario:str
@@ -283,47 +262,25 @@ class TheOccurring(BaseModel):
             ensure_ascii=False,
         )
 
-    def slim_context(self, focus_facet: str, total_context_chars: int = 4000) -> str:
+    def slim_context(self, focus_facet: str) -> str:
+        """Per-cell context: the focus node, plus the other four for orientation.
+
+        Nothing is truncated. Node length is bounded where the text is WRITTEN
+        (REFORMULATION_SYSTEM caps each node's content), not where it is read —
+        cutting at a character count handed the model a severed clause that still
+        reads as a complete claim, which is the one failure a conflict-analysis
+        system cannot absorb. That also retires the old 4000-char budget, which
+        was never enforced: the focus node's share was computed and never applied.
+        """
         focus = self.get_node(focus_facet)
-        budgets = _slim_budget_per_node(self.nodes, focus_facet, total_context_chars)
-        context_summary = {
-            str(n.facet): _truncate_content(n.content, limit=budgets[n.facet])
-            for n in self.nodes if n.facet != focus_facet
-        }
         return json.dumps({
             "focus_node": ({"facet": str(focus.facet), "content": focus.content,
                             "assumptions": focus.assumptions} if focus else None),
-            "context_summary": context_summary,
-            "context_budget": {
-                "focus_chars": len(focus.content) if focus else 0,
-                "truncated_nodes": [str(n.facet) for n in self.nodes
-                                    if n.facet != focus_facet and len(n.content) > budgets[n.facet]],
+            "other_nodes": {
+                str(n.facet): n.content
+                for n in self.nodes if n.facet != focus_facet
             },
         }, ensure_ascii=False)
-
-
-class NodeUpdateDelta(BaseModel):
-    facet: Facet
-    similarity: float
-    model_claimed_changed: bool
-    actually_changed: bool
-    content_kept: str
-    content_proposed: str
-    conflict: bool
-
-
-class TheOccurringUpdateResult(BaseModel):
-    occurring: TheOccurring
-    deltas: list[NodeUpdateDelta]
-
-    @property
-    def any_meaningful_change(self) -> bool:
-        return any(d.actually_changed for d in self.deltas)
-
-    @property
-    def conflicted_nodes(self) -> list[str]:
-        return [str(d.facet) for d in self.deltas if d.conflict]
-
 
 
 #reasoning girds
@@ -368,6 +325,10 @@ class CellConflict(BaseModel):
     is_semantic_subtype: bool = False   # only meaningful when interpretive
     severity: int = Field(ge=1, le=5)
     resolvability: Resolvability
+    # Derived, never model-authored: the remedy the taxonomy prescribes for this
+    # conflict's type. Filled in by the validator below so it is persisted with
+    # the conflict and available to integration and generation alike.
+    intervention: str = ""
 
     @field_validator("implication")
     @classmethod
@@ -396,6 +357,10 @@ class CellConflict(BaseModel):
             raise ValueError(f"{self.resolvability!r} not allowed for {self.conflict_type!r}")
         if self.is_semantic_subtype and self.conflict_type != ConflictType.INTERPRETIVE:
             raise ValueError("is_semantic_subtype is only valid for interpretive conflicts")
+        # Always re-derive: the intervention is a function of the type, so a
+        # model-supplied value (or a stale one after a type correction) is wrong
+        # by construction.
+        self.intervention = get_intervention_text(self.conflict_type)
         return self
 
 class WholenessEntry(BaseModel):
@@ -448,8 +413,17 @@ class ImplyingNodes(BaseModel):
         """Valid targets for a wholeness ref — used to catch invented citations."""
         return {c.cell_id or f"{c.facet}/{c.dimension}" for c in self.conflicts}
 
-    def to_context(self, cycle: int) -> dict | None:
-        """One constraining-context payload fed to BOTH agents in the next cycle."""
+    def to_context(self, cycle: int) -> dict:
+        """One constraining-context payload fed to BOTH agents in the next cycle.
+
+        ALWAYS returns a payload, never None. An empty synthesis is a legitimate
+        outcome — the mediation prompt tells the model four of the six fields
+        should stay empty unless warranted, and _entries drops findings whose refs
+        were invented — but returning None for it used to make both cell prompt
+        builders raise `cycle N requires prior_mediation_json`, killing the run on
+        cycle 2 after cycle 1 had already been paid for. An empty guidance block
+        is information ("nothing new last cycle"), so we say that explicitly.
+        """
         w = self.wholeness
         guidance = {
             k: [e.model_dump(mode="json") for e in v]
@@ -462,10 +436,19 @@ class ImplyingNodes(BaseModel):
                 "updated_perspectives": w.updated_perspectives,
             }.items() if v
         }
-        if not guidance:
-            return None
-        return {"from_cycle": cycle, "guidance": guidance,
-                "_note": "Produced by the mediator last cycle. Refine — do not repeat."}
+        note = ("Produced by the mediator last cycle. Refine — do not repeat."
+                if guidance else
+                "The mediator produced no new findings last cycle. Reason from "
+                "The Occurring as it now stands; do not invent guidance.")
+        payload: dict = {"from_cycle": cycle, "guidance": guidance, "_note": note}
+        # The remedy class each conflict implies, deduped. Carries the taxonomy's
+        # intervention prose into the NEXT cycle's reasoning rather than leaving it
+        # to surface only in the final document.
+        interventions = list(dict.fromkeys(
+            c.intervention for c in self.conflicts if c.intervention))
+        if interventions:
+            payload["what_these_conflicts_need"] = interventions
+        return payload
 
 
 
@@ -505,16 +488,34 @@ class CulturalIdentity(BaseModel):
 
 
 class WorkingPerspective(BaseModel):
+    """The challenger's evolving lens: its fixed identity, plus what mediation has
+    since asked it to take on.
+
+    Accumulates instead of replacing. The previous version stored a single string
+    and overwrote it each cycle from `updated_perspectives[0]` — an arbitrary pick
+    from an unordered list, which silently discarded the rest and left no record of
+    how the lens got there.
+    """
     cycle_last_updated: int = 0
-    prose: str | None = None
+    entries: list[WholenessEntry] = []
+
+    def with_updates(self, cycle: int, new: list[WholenessEntry]) -> "WorkingPerspective":
+        """Append `new`, skipping exact repeats. Returns self when nothing is added."""
+        seen = {e.statement.strip() for e in self.entries}
+        added = [e for e in new if e.statement.strip() and e.statement.strip() not in seen]
+        if not added:
+            return self
+        return WorkingPerspective(cycle_last_updated=cycle,
+                                  entries=[*self.entries, *added])
 
     def render_for_prompt(self, identity: "CulturalIdentity") -> str:
         identity_str = identity.render()
-        if self.prose is None:
+        if not self.entries:
             return identity_str
-        if not identity_str:
-            return self.prose
-        return f"{identity_str}\n\nMediating perspective (cycle {self.cycle_last_updated}): {self.prose}"
+        lines = "\n".join(f"- {e.statement}" for e in self.entries)
+        block = (f"Lens refinements mediation has asked you to carry "
+                 f"(latest cycle {self.cycle_last_updated}):\n{lines}")
+        return f"{identity_str}\n\n{block}" if identity_str else block
 
 
 CULTURE_DIMENSION_MENU: dict[str, tuple[str, str]] = {
@@ -525,29 +526,6 @@ CULTURE_DIMENSION_MENU: dict[str, tuple[str, str]] = {
     "long_term_orientation": ("long", "short"),
     "indulgence": ("indulgent", "restrained"),
 }
-
-# Moral arm: Moral Foundations, same shape
-MORAL_VALUE_MENU: dict[str, tuple[str, str]] = {
-    "care": ("care", "harm"),
-    "fairness": ("fairness", "cheating"),
-    "loyalty": ("loyalty", "betrayal"),
-    "authority": ("authority", "subversion"),
-    "sanctity": ("sanctity", "degradation"),
-    "liberty": ("liberty", "oppression"),
-}
-
-FRAME_MENUS: dict[str, dict[str, tuple[str, str]]] = {
-    "cultural": CULTURE_DIMENSION_MENU,
-    "moral": MORAL_VALUE_MENU,
-}
-
-
-class DetectedFrames(BaseModel):
-    main: list[CultureAxis]
-    challenger: list[CultureAxis]
-    rationale: str
-    menu: Literal["cultural", "moral"] = "cultural"
-
 
 #session Memeory
 class CompressedHistoryEntry(BaseModel):
@@ -586,17 +564,9 @@ class SessionMemory(BaseModel):
     scenario_id: str
     main_cultural_frame: CulturalFrame
     challenger_cultural_frame: CulturalFrame
-    auto_detect_frames: bool = False
-    frame_detection: "DetectedFrames | None" = None
-    frame_menu: Literal["cultural", "moral"] = "cultural"
-    challenger_style: str = (
-        "procedural adversarial argumentation: surface load-bearing assumptions, "
-        "demand they be justified rather than asserted, and refuse to let any single "
-        "cultural norm stand in as a universal fact")
     mediator_frame: str = (
         "procedural rationalist: prioritizes logical consistency, explicit reasoning, "
         "and symmetrical treatment of both parties")
-    main_identity: CulturalIdentity = Field(default_factory=CulturalIdentity)
     challenger_identity: CulturalIdentity = Field(default_factory=CulturalIdentity)
     challenger_working_perspective: WorkingPerspective = Field(default_factory=WorkingPerspective)
     occurring: TheOccurring | None = None
@@ -605,12 +575,22 @@ class SessionMemory(BaseModel):
     mediation_history: list[ImplyingNodes] = []
     compressed_history: list[CompressedHistoryEntry] = []
     current_cycle: int = 1          # cycles are 1-indexed (prompts.py guards assume it)
-    max_cycles: int = 3
-    # Stop after the loop instead of writing the final document. The
-    # convergence-based (NormAd) and dominant-type (MDD) classifiers read the
-    # mediation output, not the prose, so an evaluation run that does not need
-    # the document should not pay for it. Persisted so a run records what it did.
-    skip_generation: bool = True 
+    max_cycles: int = 2
+    # How the loop terminates. "fixed" runs exactly max_cycles and records the
+    # convergence measures as telemetry; "convergence" lets them route. Fixed is
+    # the default because every eval path has always passed max_cycles=1, so the
+    # convergence branch had never executed — the policy was already fixed by
+    # accident, and this states it.
+    cycle_policy: Literal["fixed", "convergence"] = "fixed"
+    # Per-cycle convergence telemetry, recorded under BOTH policies so a run is
+    # analysable afterwards even when the measures did not decide anything.
+    stability_log: list[dict] = []
+    # Stop after the loop instead of writing the final document. Defaults to False
+    # here AND on run_scenario — the two used to disagree, so the same switch meant
+    # opposite things depending on how a run was constructed. Evaluation runners
+    # whose classifiers read the mediation rather than the prose pass True
+    # explicitly. Persisted so a run records what it did.
+    skip_generation: bool = False
     convergence_metric: Literal["jaccard", "embedding"] = "embedding"
     jaccard_convergence_threshold: float = 0.7
     embedding_convergence_threshold: float = 0.85
@@ -625,11 +605,27 @@ class SessionMemory(BaseModel):
     max_consecutive_failures: int = 5
     final_output: str | None = None
     converged: bool = False
+    # Data the pipeline discarded. Every one of these was previously a log line
+    # nobody aggregated, which is why a run that dropped half its conflicts and a
+    # clean run looked identical. verify_session asserts they are zero.
+    conflicts_dropped: int = 0
+    refs_dropped: int = 0
+    sentences_stripped: int = 0
+
+    @property
+    def refinement_rate(self) -> float:
+        """Fraction of cells that cost a retry. Baseline (pre-rewrite) was 0.50."""
+        cells = [c for g in self.main_grids + self.challenger_grids for c in g.cells]
+        if not cells:
+            return 0.0
+        return sum(1 for c in cells if c.refinement_attempts) / len(cells)
 
     @model_validator(mode="after")
     def derive_identities(self) -> "SessionMemory":
-        if self.main_identity.is_neutral:
-            self.main_identity = CulturalIdentity.from_frame(self.main_cultural_frame)
+        # Only the challenger routes through CulturalIdentity — it is the side
+        # that carries a WorkingPerspective on top of its frame. The main agent
+        # renders main_cultural_frame directly via prompts.render_frame, so a
+        # main_identity would have been built and never read.
         if self.challenger_identity.is_neutral:
             self.challenger_identity = CulturalIdentity.from_frame(self.challenger_cultural_frame)
         return self

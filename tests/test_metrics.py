@@ -10,14 +10,12 @@ for p in (_ROOT, _ROOT / "thirdspace"):
 
 import metrics
 from metrics import conflict_jaccard
-from models import ImplyingNodes, WholenessImplyingNodes, CellConflict
+from models import ImplyingNodes, WholenessImplyingNodes, WholenessEntry, CellConflict
 
 
-def _wholeness():
+def _wholeness(implies=()):
     return WholenessImplyingNodes(
-        query_assumptions=[], reformulated_query=None, new_objective=None,
-        updated_challenger_perspective=None, objective_assumptions=[],
-        perspective_assumptions=[],
+        what_conflicts_imply=[WholenessEntry(statement=s) for s in implies],
     )
 
 
@@ -25,15 +23,14 @@ def _conflict(facet, dimension):
     return CellConflict(
         facet=facet, dimension=dimension,
         main_summary="m", challenger_summary="c",
-        challenger_response_type="challenge",
         implication=(
             "This reveals that the two frames hold incompatible definitions "
             "of professional respect in this exchange."
         ),
-        conflict_type="structural",
+        conflict_type="power_related",
         conflict_type_rationale=(
-            "Classified structural because the asymmetry reproduces under any "
-            "occupants of these roles."
+            "Step four fired: the asymmetry reproduces under any occupants of "
+            "these roles, independent of what either believes is right."
         ),
         severity=3, resolvability="structural_change",
     )
@@ -42,7 +39,6 @@ def _conflict(facet, dimension):
 def _cycle(cycle, conflicts):
     return ImplyingNodes(
         cycle=cycle, agreements=[], conflicts=conflicts,
-        what_conflicts_imply=[], updated_assumptions=[],
         wholeness=_wholeness(), converged=False,
     )
 
@@ -50,8 +46,7 @@ def _cycle(cycle, conflicts):
 def _cycle_implies(cycle, implies):
     return ImplyingNodes(
         cycle=cycle, agreements=[], conflicts=[],
-        what_conflicts_imply=implies, updated_assumptions=[],
-        wholeness=_wholeness(), converged=False,
+        wholeness=_wholeness(implies), converged=False,
     )
 
 
@@ -66,14 +61,14 @@ def _char_embed(text):
 # --- conflict_jaccard ---
 
 def test_identical_sets_is_one():
-    a = _cycle(0, [_conflict("individuals", "objective")])
-    b = _cycle(1, [_conflict("individuals", "objective")])
+    a = _cycle(0, [_conflict("agents", "constraint")])
+    b = _cycle(1, [_conflict("agents", "constraint")])
     assert conflict_jaccard(a, b) == 1.0
 
 
 def test_disjoint_sets_is_zero():
-    a = _cycle(0, [_conflict("individuals", "objective")])
-    b = _cycle(1, [_conflict("process", "evidence")])
+    a = _cycle(0, [_conflict("agents", "constraint")])
+    b = _cycle(1, [_conflict("actions", "observation")])
     assert conflict_jaccard(a, b) == 0.0
 
 
@@ -82,10 +77,10 @@ def test_both_empty_is_one():
 
 
 def test_partial_overlap():
-    a = _cycle(0, [_conflict("individuals", "objective")])
+    a = _cycle(0, [_conflict("agents", "constraint")])
     b = _cycle(1, [
-        _conflict("individuals", "objective"),
-        _conflict("process", "evidence"),
+        _conflict("agents", "constraint"),
+        _conflict("actions", "observation"),
     ])
     # intersection {1}, union {2} → 0.5
     assert conflict_jaccard(a, b) == 0.5
@@ -94,8 +89,8 @@ def test_partial_overlap():
 # --- conflict_signature ---
 
 def test_signature_joins_implications_and_patterns():
-    c = _cycle(0, [_conflict("individuals", "objective")])
-    c.what_conflicts_imply = ["pattern A", "pattern B"]
+    c = _cycle(0, [_conflict("agents", "constraint")])
+    c.wholeness = _wholeness(["pattern A", "pattern B"])
     sig = metrics.conflict_signature(c)
     assert "This reveals that" in sig
     assert "pattern A" in sig and "pattern B" in sig
@@ -103,7 +98,7 @@ def test_signature_joins_implications_and_patterns():
 
 def test_signature_skips_empty_and_whitespace():
     c = _cycle(0, [])
-    c.what_conflicts_imply = ["", "real pattern", "   "]
+    c.wholeness = _wholeness(["", "real pattern", "   "])
     assert metrics.conflict_signature(c) == "real pattern"
 
 
@@ -166,8 +161,8 @@ def test_embed_resolves_module_global(monkeypatch):
 # --- convergence_similarity dispatch ---
 
 def test_dispatch_jaccard():
-    a = _cycle(0, [_conflict("individuals", "objective")])
-    b = _cycle(1, [_conflict("process", "evidence")])
+    a = _cycle(0, [_conflict("agents", "constraint")])
+    b = _cycle(1, [_conflict("actions", "observation")])
     assert metrics.convergence_similarity(a, b, "jaccard") == 0.0
 
 
@@ -175,7 +170,7 @@ def test_dispatch_embedding_compares_content_not_cells(monkeypatch):
     # Same implication text on DIFFERENT cells: jaccard reads 0 (no cell overlap),
     # but the embedding metric compares content -> ~1.0.
     monkeypatch.setattr(metrics, "embed_text", _char_embed)
-    a = _cycle(0, [_conflict("individuals", "objective")])
-    b = _cycle(1, [_conflict("process", "evidence")])
+    a = _cycle(0, [_conflict("agents", "constraint")])
+    b = _cycle(1, [_conflict("actions", "observation")])
     assert metrics.convergence_similarity(a, b, "jaccard") == 0.0
     assert metrics.convergence_similarity(a, b, "embedding") == pytest.approx(1.0)

@@ -10,6 +10,7 @@ from models import SessionMemory, TheOccurring, CultureAxis, CulturalFrame
 from graph import build_graph
 from budget import set_active_memory, reset_active_memory
 from utils.prompts import render_frame
+from verify import verify_session, format_report
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,13 +43,27 @@ def _make_scenario_id(
     raw_scenario: str,
     main_frame: CulturalFrame | None,
     challenger_frame: CulturalFrame | None,
+    max_cycles: int = 0,
+    mediator_frame: str = "",
 ) -> str:
-    """Deterministic 12-char id from the inputs, so re-running the same scenario
-    writes to the same output file (reproducible; no orphaned partial runs).
+    """Deterministic 12-char id from everything that changes the result.
+
+    Re-running an identical configuration writes to the same output file
+    (reproducible; no orphaned partial runs), but a DIFFERENT configuration must
+    get a different file. The run parameters used to be excluded, so a 1-cycle and
+    a 3-cycle run of the same scenario overwrote each other's session JSON —
+    destroying exactly the comparison an ablation exists to make.
+
     Frames are rendered first so a dimensional frame and its string form produce
-    stable, comparable ids. In auto-detect mode (both frames None) the frames
-    aren't known yet, so the id hashes the raw scenario alone."""
-    content = f"{raw_scenario}|{render_frame(main_frame)}|{render_frame(challenger_frame)}"
+    stable, comparable ids.
+    """
+    content = "|".join([
+        raw_scenario,
+        render_frame(main_frame),
+        render_frame(challenger_frame),
+        f"cycles={max_cycles}",
+        f"mediator={mediator_frame}",
+    ])
     return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 
@@ -69,9 +84,12 @@ def run_scenario(
     for a side puts that agent in NEUTRAL mode, where the prompt drops its frame
     block entirely rather than rendering an empty one.
 
-    skip_generation stops the run after the loop. The convergence-based (NormAd)
-    and dominant-conflict-type (MDD) classifiers read the mediation output, so an
-    evaluation that does not need the document should not pay for it.
+    skip_generation stops the run after the loop. It defaults to False here AND on
+    SessionMemory — the two used to disagree (False here, True there), so the same
+    switch meant opposite things depending on how a run was constructed. Generating
+    is the default because the document is the system's output; the evaluation
+    runners whose classifiers read the mediation instead pass skip_generation=True
+    explicitly, at the call site where the money is spent.
     """
     # A lone None coerces to "" — neutral for that side.
     main_cultural_frame = "" if main_cultural_frame is None else main_cultural_frame
@@ -80,7 +98,8 @@ def run_scenario(
     )
 
     scenario_id = _make_scenario_id(
-        raw_scenario, main_cultural_frame, challenger_cultural_frame
+        raw_scenario, main_cultural_frame, challenger_cultural_frame,
+        max_cycles=max_cycles, mediator_frame=mediator_frame or "",
     )
     fields = {
         "scenario_id": scenario_id,
@@ -124,6 +143,15 @@ def run_scenario(
     finally:
         reset_active_memory(token)
     final = result["memory"]
+
+    # Invariant check before persisting: costs nothing, and turns "the run
+    # finished" into "the run finished and is internally consistent". Never fatal
+    # — a completed run is worth keeping even when a check fails, and the report
+    # travels with the session so the failure cannot be missed later.
+    problems = verify_session(final)
+    logger.log(logging.WARNING if problems else logging.INFO,
+               f"[{final.scenario_id}] {format_report(problems)}")
+
     if output_dir is not None:
         path = persist_session(final, output_dir)
         logger.info(f"[{final.scenario_id}] Persisted session to {path}")

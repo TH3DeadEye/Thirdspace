@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import difflib
 import hashlib
 import json 
 import logging
@@ -11,13 +10,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 from langsmith import traceable
 from langsmith.run_helpers import get_current_run_tree
+from pydantic import ValidationError
 from models import (
     TheOccurring, OccurringNode,
     NodeReasoningGrid, NodeDimensionCell, ReflectionFlag,
     ImplyingNodes, CellConflict, WholenessImplyingNodes, WholenessEntry,
     ConflictTypeSummary, CompressedHistoryEntry,
     FACET_LIST, DIMENSION_LIST, NUM_FACET, NUM_CELLS,
-    CulturalFrame, CulturalIdentity, WorkingPerspective, CultureAxis,
+    CulturalFrame, CulturalIdentity, WorkingPerspective,
 )
 from llm import call_llm, call_llm_json, call_llm_json_with_refinement, CHALLENGER_MODEL_ID
 from budget import active_memory, get_active_memory
@@ -28,36 +28,35 @@ logger = logging.getLogger(__name__)
 #cell-level concurrecnty.
 _CELL_WORKERS = max(1, int(os.environ.get("THIRDSPACE_CELL_WORKERS", "8")))
 
-#skipping a cell pair in mediation when both readings are near-identical
-AGREEMENT_SIMILARITY_THRESHOLD = 0.90
-
-DEDUPE_MIN_RATIO= 0.4
-
 GENERATION_MAX_TOKENS = 4000
 GENERATION_WORD_BUDGET = 900
 
 def _cell_pairs() -> list[tuple[str, str]]:
     return [(str(f), str(d)) for f in FACET_LIST for d in DIMENSION_LIST]
 
-def _similar(a:str, b:str) -> float:
-    #1.0 means they are identical , 0.0 means they have nothing in common
-    return difflib.SequenceMatcher(None, a.strip(), b.strip()).ratio()
 
-def _render_frame(frame:CulturalFrame | CulturalIdentity | None) -> str:
-    #string | list[culturalAxis] | CulturalIdentity - > prompt string.
-    """ means NEUTRAL mode — the prompt drops its frame block entirely rather
-    than rendering an empty one. Local to agents.py because prompts.py does
-    not export a render_frame.
+def _norm_id(raw) -> str:
+    """Canonical '<facet>/<dimension>' form for a conflict id.
+
+    Model-supplied ids vary in case and spacing ("Agents/Value", "agents / value",
+    a trailing space). Normalizing every id the same way — on the way in AND when
+    matching a wholeness ref against it — is what keeps the two sides comparable.
+    A non-id string (a carried-forward finding) just lowercases, which is harmless
+    as long as both sides go through here.
     """
+    return "/".join(p.strip().lower() for p in str(raw).split("/", 1))
 
-    if frame is None:
-        return ""
-    if isinstance(frame, CulturalIdentity):
-        return frame.render()
-    if isinstance(frame, list):
-        return "; ".join(f"{a.dimension}: {a.value}" for a in frame if isinstance(a, CultureAxis))
-    return str(frame)
 
+def _bump(counter: str, n: int = 1) -> None:
+    """Add to a drop counter on the active SessionMemory, if one is registered.
+
+    No lock: every caller runs on the main thread (mediation is a single call and
+    _record_repetition is a sequential post-pass), unlike the cell counters in budget.py
+    which fan out across the executor.
+    """
+    mem = get_active_memory()
+    if mem is not None:
+        setattr(mem, counter, getattr(mem, counter, 0) + n)
 
 #cell helpers
 def _parse_flags(raw_flags) -> list[ReflectionFlag]:
@@ -106,33 +105,38 @@ def _hash_sentence(sentence:str) -> str:
     norm = re.sub(r"\s+", " ", norm).strip()
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
 
-def _dedupe_grid(cells: list[NodeDimensionCell], agent: str, cycle: int) -> list[NodeDimensionCell]:
-    """Strip sentences an EARLIER cell in this grid already used.
+def _record_repetition(cells: list[NodeDimensionCell], agent: str, cycle: int) -> list[NodeDimensionCell]:
+    """Measure cross-cell repetition. Records, never edits.
 
-    30 cells each restating the same background is the token leak the design
-    calls out. Runs as a sequential post-pass because parallel cells can't
-    share the `seen` set. First cell to use a sentence keeps it; the safety
-    floor means a repetitive cell degrades instead of vanishing. content_hashes
-    is recorded either way, so you can measure repetition even when nothing
-    was stripped.
+    This used to STRIP any sentence an earlier cell in the same grid had used,
+    to cut the tokens mediation pays for. The saving was real but it was taken
+    out of the measurement: the two grids were deduped independently, so a main
+    cell could lose a sentence while its paired challenger cell kept the
+    equivalent one, and mediation then compared a trimmed reading against a full
+    one — making the pair look more divergent than it was and inflating the
+    conflict count. Same defect as the agreement filter that was removed for the
+    same reason: an input optimization silently editing what gets measured.
+
+    Deduping both grids against one shared set would be worse still — the
+    challenger would lose sentences the MAIN agent said first, contaminating one
+    side's reading with the other's.
+
+    So: hashes are recorded, repetition stays measurable via `sentences_stripped`
+    as a diagnostic, and the text mediation sees is exactly the text the agents
+    wrote. If the token cost proves material, bound cell length in the prompt
+    rather than editing the output.
     """
     seen: set[str] = set()
-    stripped = 0
+    repeated = 0
     for cell in cells:
-        sentences = _split_sentences(cell.content)
-        hashes = [_hash_sentence(s) for s in sentences]
-        kept = [s for s, h in zip(sentences, hashes) if h not in seen]
+        hashes = [_hash_sentence(s) for s in _split_sentences(cell.content)]
+        repeated += sum(1 for h in hashes if h in seen)
         seen.update(hashes)
         cell.content_hashes = hashes
-        if not kept or len(kept) == len(sentences):
-            continue
-        new_content = " ".join(kept)
-        if len(new_content) < DEDUPE_MIN_RATIO * len(cell.content):
-            continue                       # would gut the cell; leave it alone
-        stripped += len(sentences) - len(kept)
-        cell.content = new_content
-    if stripped:
-        logger.info(f"[dedupe {agent} cycle={cycle}] removed {stripped} repeated sentences")
+    if repeated:
+        logger.info(f"[repetition {agent} cycle={cycle}] {repeated} sentence(s) "
+                    f"restated from an earlier cell (recorded, not removed)")
+        _bump("sentences_stripped", repeated)
     return cells
 
 
@@ -181,14 +185,20 @@ def _entries(raw, valid_ids: set[str], where: str) -> list[WholenessEntry]:
         if not statement:
             continue
         refs = [str(r) for r in (e.get("refs") or [])]
-        good = [r for r in refs if r in valid_ids]
-        bogus = [r for r in refs if r not in valid_ids]
+        # valid_ids are already normalized; normalize the refs too so a ref that
+        # differs only in case or spacing is a match, not an invention — and STORE
+        # the normalized form, so every downstream comparison (verify_session's ref
+        # resolution, cross-cycle carry-forward) sees one canonical id.
+        good = [_norm_id(r) for r in refs if _norm_id(r) in valid_ids]
+        bogus = [r for r in refs if _norm_id(r) not in valid_ids]
         if refs and not good:
             logger.warning(f"[{where}] dropping finding, every ref invented {bogus}: "
                            f"{statement[:70]}")
+            _bump("refs_dropped")
             continue
         if bogus:
             logger.warning(f"[{where}] dropped invented refs {bogus} from: {statement[:70]}")
+            _bump("refs_dropped", len(bogus))
         out.append(WholenessEntry(statement=statement, refs=good))
     return out
 
@@ -263,7 +273,9 @@ def run_critical_thinking(occurring: TheOccurring, cultural_frame: CulturalFrame
                           cycle: int, prior_mediation: ImplyingNodes | None = None
                           ) -> NodeReasoningGrid:
 
-    frame = _render_frame(cultural_frame)
+    # One renderer for both agents (prompts.render_frame). "" is NEUTRAL mode:
+    # the prompt drops its frame block entirely rather than rendering an empty one.
+    frame = prompts.render_frame(cultural_frame)
     # Each cell gets its focus node in full and the others truncated, instead
     # of the whole Occurring on all 30 calls.
     slim = {str(f): occurring.slim_context(str(f)) for f in FACET_LIST}
@@ -290,7 +302,7 @@ def run_critical_thinking(occurring: TheOccurring, cultural_frame: CulturalFrame
     if len(cells) != NUM_CELLS:
         raise ValueError(f"Main grid: expected {NUM_CELLS} cells, got {len(cells)}")
     return NodeReasoningGrid(cycle=cycle, agent="main",
-                             cells=_dedupe_grid(cells, "main", cycle))
+                             cells=_record_repetition(cells, "main", cycle))
 
 
 @traceable(run_type="chain")
@@ -359,7 +371,7 @@ def run_challenger(occurring: TheOccurring, challenger_identity: CulturalIdentit
         raise ValueError(f"Challenger grid: expected {NUM_CELLS} cells, got {len(cells)}")
 
     return NodeReasoningGrid(cycle=cycle, agent="challenger",
-                             cells=_dedupe_grid(cells, "challenger", cycle))
+                             cells=_record_repetition(cells, "challenger", cycle))
 
 
 
@@ -378,10 +390,15 @@ def run_mediation(occurring: TheOccurring, main_grid: NodeReasoningGrid,
     scenario+cycle so a run is reproducible"""
 
     rng = random.Random(f"{occurring.scenario_id}:{cycle}")
-    ab_map: dict[str, tuple[str, str]] = {}
+    # Keyed on the (facet, dimension) WE generated, never on the id string the
+    # model echoes back. Keying on the echo meant any variation in case or
+    # spacing missed the map, silently fell through to the default, and wrote
+    # main_summary/challenger_summary backwards for the half of cells that had
+    # been shuffled — corrupting the record of which agent held which position,
+    # with no error anywhere.
+    ab_map: dict[tuple[str, str], tuple[str, str]] = {}
 
     pairs_by_facet:dict = {}
-    skipped = 0
     for f in FACET_LIST:
         facet, row = str(f), {}
         for d in DIMENSION_LIST:
@@ -391,22 +408,14 @@ def run_mediation(occurring: TheOccurring, main_grid: NodeReasoningGrid,
             main_txt = mc.content if mc else ""
             chall_txt = cc.content if cc else ""
 
-            # Input trimming: don't spend tokens on pairs that plainly agree.
-            if main_txt and chall_txt and _similar(main_txt, chall_txt) >= AGREEMENT_SIMILARITY_THRESHOLD:
-                skipped += 1
-                continue
-            cell_id = f"{facet}/{dim}"
             if rng.random() < 0.5:
                 row[dim] = {"reading_a": main_txt, "reading_b": chall_txt}
-                ab_map[cell_id] = ("main", "challenger")
+                ab_map[(facet, dim)] = ("main", "challenger")
             else:
                 row[dim] = {"reading_a": chall_txt, "reading_b": main_txt}
-                ab_map[cell_id] = ("challenger", "main")
+                ab_map[(facet, dim)] = ("challenger", "main")
         # Facet level — after the dimension loop, so all 6 dimensions land.
-        if row:
-            pairs_by_facet[facet] = row
-    if skipped:
-        logger.info(f"[mediation cycle={cycle}] skipped {skipped}/{NUM_CELLS} near-identical pairs")
+        pairs_by_facet[facet] = row
 
     result = call_llm_json(
         system=prompts.MEDIATION_SYSTEM,
@@ -425,8 +434,17 @@ def run_mediation(occurring: TheOccurring, main_grid: NodeReasoningGrid,
     for c in result.get("conflicts", []):
         try:
             facet, dim = c["facet"], c["dimension"]
-            cell_id = c.get("id") or f"{facet}/{dim}"
-            role_a, _ = ab_map.get(cell_id, ("main", "challenger"))
+            key = (str(facet).strip().lower(), str(dim).strip().lower())
+            cell_id = "/".join(key)
+            roles = ab_map.get(key)
+            if roles is None:
+                # The model named a cell outside the ontology. CellConflict's
+                # Facet/Dimension enums are about to reject it anyway, but say so
+                # here so the cause is obvious rather than a bare validation error.
+                logger.warning(f"[mediation cycle={cycle}] conflict names an unknown "
+                               f"cell {key}; not one of the {NUM_CELLS} pairs sent")
+                roles = ("main", "challenger")
+            role_a, _ = roles
             a, b = c.get("reading_a_content", ""), c.get("reading_b_content", "")
             main_summary, chall_summary = (a, b) if role_a == "main" else (b, a)
             conflicts.append(CellConflict(
@@ -439,12 +457,18 @@ def run_mediation(occurring: TheOccurring, main_grid: NodeReasoningGrid,
                 severity=c.get("severity", 3),
                 resolvability=c["resolvability"],
             ))
-        except Exception as exc:
+        # Narrow on purpose: a blanket `except Exception` here also swallowed our
+        # own bugs (a TypeError in this block looked exactly like a bad response).
+        except (KeyError, TypeError, ValidationError) as exc:
             logger.warning(f"[mediation cycle={cycle}] dropped invalid conflict "
                            f"({c.get('facet')}, {c.get('dimension')}): {exc}")
+            # Counted, not just logged: dropped conflicts deflate the conflict
+            # count and the type distribution the classifiers read, so a run that
+            # lost half its conflicts must not look like a clean one.
+            _bump("conflicts_dropped")
     # A ref may cite this cycle's conflicts or a finding carried from history.
     carried = [str(r) for r in result.get("carried_forward", [])]
-    valid_ids = {c.cell_id for c in conflicts} | set(carried)
+    valid_ids = {c.cell_id for c in conflicts} | {_norm_id(r) for r in carried}
     where = f"mediation cycle={cycle}"
     w = result.get("wholeness", {}) or {}
     wholeness = WholenessImplyingNodes(
@@ -535,11 +559,22 @@ def run_constrained_generation(occurring: TheOccurring,
     cross_cycle = ConflictTypeSummary.aggregate(
         [m.conflict_type_summary for m in mediation_history])
     # Severity >= 3 only: the document should lead with what's load-bearing.
-    salient = sorted([c for m in mediation_history for c in m.conflicts if c.severity >= 3],
+    all_conflicts = [c for m in mediation_history for c in m.conflicts]
+    salient = sorted([c for c in all_conflicts if c.severity >= 3],
                      key=lambda c: c.severity, reverse=True)
 
+    # Which remedies the document must carry, most load-bearing first. Weighted by
+    # summed severity rather than raw count, so three severity-5 power conflicts
+    # outrank six severity-1 interpretive ones — the dominant type by headcount is
+    # not necessarily the one doing the work.
+    weights: dict[str, int] = {}
+    for c in all_conflicts:
+        weights[str(c.conflict_type)] = weights.get(str(c.conflict_type), 0) + c.severity
+    weighted_types = sorted(weights, key=weights.get, reverse=True)
+
     doc = call_llm(
-        system=prompts.build_constrained_generation_system(cross_cycle, GENERATION_WORD_BUDGET),
+        system=prompts.build_constrained_generation_system(
+            cross_cycle, GENERATION_WORD_BUDGET, weighted_types=weighted_types),
         user=prompts.constrained_generation_user(
             occurring_json=occurring.to_nodes_json(),
             distilled_wholeness_json=json.dumps(

@@ -9,7 +9,7 @@ ACL 2025) on the same dataset, scoring both accuracy and per-country parity.
 Arms (both receive identical inputs — story + country; the rule-of-thumb is
 withheld from both, since it nearly encodes the answer):
   single    one LLM call producing an adhere/violate/neither judgment
-  pipeline  the full ThirdSpace run (auto frame detection, max_cycles=1),
+  pipeline  the full ThirdSpace run (frames read from the dataset record),
             plus one call reducing the final document to the same ternary
             judgment; the document is also grep'd for LEAK_PHRASES
 
@@ -38,13 +38,30 @@ logger = logging.getLogger(__name__)
 
 JUDGMENTS = ("adhere", "violate", "neither")  # matches label_maps/normad_v1.yaml
 
-# Dry-run cost model. Single arm: one small call. Pipeline arm: measured
-# pre-fix runs cost $1.50-2 at ~130 calls/401K tokens; the refinement fix
-# removes the ~32% retry overhead, so ~$1.20 is the planning estimate at
-# max_cycles=1 (mixed Sonnet cells/mediation + Haiku challenger).
+# How many cycles the pipeline arm runs. The loop policy is fixed-N (see
+# SessionMemory.cycle_policy), so this is the whole cost story: each cycle is
+# 2*NUM_CELLS cell calls plus one mediation.
+PIPELINE_CYCLES = 2
+
+# Dry-run cost model. Single arm: one small call.
+#
+# Pipeline arm, per cycle: NUM_CELLS main (Sonnet) + NUM_CELLS challenger (Haiku)
+# + 1 mediation (Sonnet). Plus, once: reformulation and generation. Plus, per
+# extra cycle: one node update and two convergence embeddings. Plus the verdict
+# call this runner makes itself.
+#
+# Reference point: a pre-rewrite run of the same scenario cost 130 calls /
+# 401K tokens for ONE cycle, with 50% of cells paying for a refinement retry.
+# The retry fix removes that overhead and the grid went 42 -> 30 cells.
 EST_SINGLE_IN, EST_SINGLE_OUT = 700, 250
-EST_PIPELINE_USD = 1.20
-EST_PIPELINE_CALLS = 90
+EST_PIPELINE_CALLS = (
+    1                                        # reformulation
+    + PIPELINE_CYCLES * (2 * 30 + 1)         # cells + mediation per cycle
+    + (PIPELINE_CYCLES - 1) * 3              # node update + 2 embeddings per loop
+    + 1                                      # constrained generation
+    + 1                                      # this runner's verdict call
+)
+EST_PIPELINE_USD = 0.65 * PIPELINE_CYCLES
 
 SINGLE_SYSTEM = """\
 You judge whether an action described in a story is appropriate under the
@@ -102,11 +119,21 @@ def run_pipeline_arm(rec: dict, sessions_dir: Path) -> dict:
     from llm import call_llm_json
     from main import run_scenario
     from models import LEAK_PHRASES
+    from utils.prompts import read_cultural_frames
+    from verify import verify_session
+
+    # The frames come from the dataset labels, as a controlled variable. They used
+    # to be smuggled into the prose as "(Setting: {country}) ..." with BOTH agents
+    # left unframed — which meant the ablation was testing an unframed pipeline in
+    # a study whose independent variable is the frame.
+    main_frame, challenger_frame = read_cultural_frames(rec, "normad")
 
     t0 = time.monotonic()
     memory = run_scenario(
-        raw_scenario=f"(Setting: {rec['country']}) {rec['story']}",
-        max_cycles=1,
+        raw_scenario=rec["story"],
+        main_cultural_frame=main_frame,
+        challenger_cultural_frame=challenger_frame,
+        max_cycles=PIPELINE_CYCLES,
         output_dir=sessions_dir,
     )
     doc = memory.final_output or ""
@@ -125,6 +152,14 @@ def run_pipeline_arm(rec: dict, sessions_dir: Path) -> dict:
         "convergence_reason": memory.convergence_reason,
         "leak_phrases_found": leaks,
         "session_id": memory.scenario_id,
+        "main_frame": main_frame,
+        "challenger_frame": challenger_frame,
+        # Per-scenario health, so a damaged run is visible in the results file
+        # rather than only in a log nobody reads afterwards.
+        "cycles": len(memory.mediation_history),
+        "refinement_rate": round(memory.refinement_rate, 3),
+        "conflicts_dropped": memory.conflicts_dropped,
+        "verification": verify_session(memory),
     }
 
 
@@ -155,7 +190,7 @@ def main() -> None:
             lines.append(
                 f"pipeline arm: ~{n * EST_PIPELINE_CALLS} calls, "
                 f"est. ${n * EST_PIPELINE_USD:.2f} (~${EST_PIPELINE_USD:.2f}/scenario "
-                f"at max_cycles=1; budget breaker caps each run)"
+                f"at max_cycles={PIPELINE_CYCLES}; budget breaker caps each run)"
             )
         dry_run_exit(lines)
 

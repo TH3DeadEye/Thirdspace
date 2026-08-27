@@ -16,7 +16,7 @@ from langsmith.run_helpers import get_current_run_tree
 from budget import (
     check_budget_before_call, record_success, record_failure,
 )
-from utils.parsing import _candidate_blocks, _count_sentences
+from utils.parsing import _candidate_blocks
 
 logger = logging.getLogger(__name__)
 #main agent LLM model 
@@ -324,29 +324,42 @@ def call_llm_json(system: str, user: str, **kwargs) -> Any:
 # Context engineering utilities (from Omid's context engineering update)
 # ---------------------------------------------------------------------------
 
-# Refinement retry cap. Retries fire only on structural defects (empty or
-# too-short content), which are rare — reflection_flags are telemetry, not
+# Refinement retry cap. Retries fire only on structural defects (an empty or
+# placeholder answer), which are rare — reflection_flags are telemetry, not
 # failures, so they never trigger a retry. Tune via env if needed.
 MAX_REFINE_ATTEMPTS = int(os.environ.get("THIRDSPACE_REFINE_ATTEMPTS", "2"))
+
+
+# Below this length a response is a placeholder ("", "N/A", "none"), not a
+# short answer. This is NOT a length target: cells are asked for AT MOST six
+# sentences, and one precise sentence is a valid cell.
+MIN_CELL_CONTENT_CHARS = 40
 
 
 def _structural_issues(result: dict) -> list[str]:
     """Objective defects that justify paying for a retry call.
 
-    Deliberately narrow: an honest model asked to self-criticize will always
-    find something, so populated reflection_flags are NOT treated as failures
-    (run-june-10-1: 126/126 cells retried on their own honesty, 49% of the
-    run's calls, and 155 cells still carried flags afterwards). Flags are kept
-    on the result as downstream context instead.
+    Deliberately narrow, in two ways.
+
+    Populated reflection_flags are NOT failures. An honest model asked to
+    self-criticize always finds something (run-june-10-1: 126/126 cells retried
+    on their own honesty, 49% of the run's calls, and 155 cells still carried
+    flags afterwards). Flags are kept on the result as downstream context.
+
+    Neither is brevity. We retry on an ABSENT answer, never on a short one. The
+    old rule retried anything under three sentences, which paid for a full call
+    to pad a cell that had already said its one true thing — and padding is
+    what the cell prompts' own "a cell that could be pasted into any other cell
+    has failed" rule exists to prevent.
     """
     content = str(result.get("content", "") or "").strip()
     if not content:
-        return ["The 'content' field is empty. Write 3 to 6 sentences."]
-    sentence_count = _count_sentences(content)
-    if sentence_count < 3:
+        return ["The 'content' field is empty. Write it, in no more than six sentences."]
+    if len(content) < MIN_CELL_CONTENT_CHARS:
         return [
-            f"Content has only {sentence_count} sentence(s). "
-            f"Write at least 3 sentences."
+            f"The 'content' field is {len(content)} characters — a placeholder, "
+            f"not a reading. Give the actual reasoning for this cell, in no "
+            f"more than six sentences."
         ]
     return []
 
@@ -364,9 +377,10 @@ def call_llm_json_with_refinement(
     Used for single-cell calls (CT agent and Challenger).
     Each call returns {"content": "...", "reflection_flags": [...], ...}.
 
-    Retries ONLY on objective structural defects (empty / too-short content —
-    see _structural_issues). reflection_flags are self-reported nuance, not
-    defects: they stay on the result untouched and never trigger a retry.
+    Retries ONLY on objective structural defects (an empty or placeholder
+    answer — see _structural_issues). Brevity is not a defect, and
+    reflection_flags are self-reported nuance, not defects: both stay on the
+    result untouched and never trigger a retry.
 
     The retry prompt is context-complete: it contains the ORIGINAL user prompt
     (The Occurring etc.), the model's previous response, and the feedback —
@@ -409,8 +423,8 @@ def call_llm_json_with_refinement(
             f"--- VALIDATION FEEDBACK ---\n"
             f"{feedback}\n\n"
             f"Rewrite your previous response so it fixes the feedback while "
-            f"keeping everything that was already correct. Write 3 to 6 "
-            f"sentences. Return valid JSON in the same format."
+            f"keeping everything that was already correct. Write no more than "
+            f"six sentences. Return valid JSON in the same format."
         )
         result = call_llm_json(system, refine_user, **kwargs)
         if not isinstance(result, dict):

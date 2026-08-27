@@ -161,6 +161,11 @@ CRITICAL RULES:
 - Each node must contain something the narrator did NOT explicitly state.
 - Each node carries a list of explicit assumptions. Name them.
 - You are not summarizing. You are decomposing.
+- LENGTH: each node's `content` is at most 120 words. Every later stage reads
+  all five nodes on every one of its calls, so a node that runs long is paid for
+  sixty times over. Write to the limit and stop — do not pad, and do not drop a
+  structural distinction to fit. If you cannot say it in 120 words, you are
+  summarizing the scenario rather than decomposing it.
 
 Respond ONLY with valid JSON. No preamble. No markdown fences.
 """
@@ -385,11 +390,11 @@ seem more consequential.
 
 {REFLECTION_MEASURES_BLOCK}
 
-Write 3 to 6 sentences.
+Write no more than six sentences.
 
 Respond ONLY with valid JSON — no preamble, no markdown fences:
 {{
-  "content": "<3 to 6 sentences>",
+  "content": "<no more than six sentences>",
   "reflection_flags": [
     {{"measure": "<name from the list above>", "issue": "<what failed>"}}
   ]
@@ -424,7 +429,7 @@ them and produce a reading that differs from the one they were derived from."""
     )
 
     user = f"""\
-THE OCCURRING (all five object nodes):
+THE OCCURRING (the node you are reasoning about, in full; the other four for orientation):
 {occurring_json}
 {guidance_block}
 
@@ -540,11 +545,11 @@ seem more interesting.
 
 {REFLECTION_MEASURES_BLOCK}
 
-Write 3 to 6 sentences.
+Write no more than six sentences.
 
 Respond ONLY with valid JSON — no preamble, no markdown fences:
 {{
-  "content": "<3 to 6 sentences>",
+  "content": "<no more than six sentences>",
   "reflection_flags": [
     {{"measure": "<name from the list above>", "issue": "<what failed>"}}
   ]
@@ -576,7 +581,7 @@ comparison_assumptions with particular attention: it is mediation's account
 of what YOU were assuming, so confirm it or correct it."""
 
     user = f"""\
-THE OCCURRING (all five object nodes):
+THE OCCURRING (the node you are reasoning about, in full; the other four for orientation):
 {occurring_json}
 
 {baseline_block}
@@ -769,7 +774,7 @@ Mediate between the two independent readings. Cycle {cycle}.
 THE OCCURRING:
 {occurring_json}
 
-CELL-BY-CELL COMPARISON (nested by facet; agreeing pairs already filtered out):
+CELL-BY-CELL COMPARISON (nested by facet; every cell pair is here, agreeing and not):
 {cell_pairs_json}
 
 PRIOR MEDIATION HISTORY (compressed — cite from it, do not repeat it):
@@ -932,20 +937,40 @@ you could not apply is correct behaviour — inventing a place to apply it is no
 def build_constrained_generation_system(
     conflict_type_summary,
     word_budget: int = 900,
+    weighted_types: list[str] | None = None,
 ) -> str:
     """System prompt for the final document.
 
-    `conflict_type_summary` is a models.ConflictTypeSummary or None; its
-    dominant type selects the intervention prose from the registry.
-    """
-    guidance_block = ""
-    if conflict_type_summary is not None:
-        defn = CONFLICT_TYPE_DEFS.get(conflict_type_summary.dominant_type)
-        if defn is not None:
-            guidance_block = f"""
+    `weighted_types` is the conflict types actually present, most load-bearing
+    first (severity-weighted, computed by the caller). Each contributes its
+    intervention prose from the registry.
 
-WHAT THIS SITUATION NEEDS:
-{defn.intervention_text}"""
+    Previously only the DOMINANT type's intervention was injected, so a scenario
+    whose conflicts were, say, 12 normative and 9 power_related was written up as
+    though the structural asymmetry were not there — and five of the six
+    interventions never reached a prompt at all. Falls back to the dominant type
+    when no weighting is supplied.
+    """
+    ordered = list(weighted_types or [])
+    if not ordered and conflict_type_summary is not None:
+        ordered = [conflict_type_summary.dominant_type]
+
+    texts: list[str] = []
+    for t in ordered:
+        defn = CONFLICT_TYPE_DEFS.get(t)
+        if defn is not None and defn.intervention_text not in texts:
+            texts.append(defn.intervention_text)
+
+    guidance_block = ""
+    if texts:
+        body = "\n\n".join(texts)
+        lead = ("WHAT THIS SITUATION NEEDS:" if len(texts) == 1 else
+                "WHAT THIS SITUATION NEEDS — these apply together, most "
+                "load-bearing first:")
+        guidance_block = f"""
+
+{lead}
+{body}"""
 
     return f"""\
 You write the final analysis that the two people in this conflict will read.
