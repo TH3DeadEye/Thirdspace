@@ -74,10 +74,14 @@ def read_cultural_frames(record: dict, dataset: str) -> tuple[str, str]:
     main_frame = _read_frame(record, mapping["main"])
     challenger_frame = _read_frame(record, mapping["challenger"])
 
+    # debug, not info: dataset loaders call this once per row, so at INFO a
+    # 2,633-record load emitted 740 identical lines and buried the output the
+    # caller actually wanted. Aggregate counts belong to the caller, which
+    # already reports framed_main / framed_challenger.
     if not main_frame:
-        logger.info("No main frame label in record; main agent runs unframed.")
+        logger.debug("No main frame label in record; main agent runs unframed.")
     if not challenger_frame:
-        logger.info("No challenger frame label in record; challenger runs unframed.")
+        logger.debug("No challenger frame label in record; challenger runs unframed.")
 
     return main_frame, challenger_frame
 

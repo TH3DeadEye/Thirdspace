@@ -1,118 +1,280 @@
-"""Aggregate eval results from eval/results/ into readable metrics. Offline.
+"""Turn predictions.jsonl into a report.
 
-Reads whatever exists:
-  frame_eval.jsonl -> per-dimension accuracy + confusion counts
-  ablation.jsonl   -> accuracy per arm (mean±std across repeats),
-                      per-country parity, leak-phrase regression check
-
-Usage:
-    python eval/report.py
+Separated from the runner so a report can be re-rendered from cached rows at
+any time — including after re-fitting the structural thresholds — without
+spending a single call.
 """
 from __future__ import annotations
 
-import statistics
-import sys
-from collections import Counter, defaultdict
+import json
+from collections import Counter
 from pathlib import Path
+from typing import Sequence
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from eval.harness import ResumeLog, results_path  # noqa: E402
+from . import metrics
 
 
-def report_frame_eval() -> None:
-    rows = ResumeLog(results_path("frame_eval.jsonl")).load_all()
-    if not rows:
-        print("frame_eval.jsonl: no results yet")
-        return
-    print(f"\n== Frame detection vs Hofstede gold ({len(rows)} runs) ==")
-    dim_totals: dict[str, Counter] = defaultdict(Counter)
-    confusion: dict[str, Counter] = defaultdict(Counter)
+def _pairs(rows: Sequence[dict], key: str) -> list[tuple[str, str | None]]:
+    """(gold, prediction) for one system. `key` is a top-level column
+    ('prediction') or a nested head ('structural', 'readout', 'baseline')."""
+    out = []
     for row in rows:
-        for dim, d in row["per_dimension"].items():
-            dim_totals[dim]["n"] += 1
-            dim_totals[dim]["main"] += bool(d["main_match"])
-            dim_totals[dim]["either"] += bool(d["either_match"])
-            confusion[dim][f"gold={d['gold']} -> main={d['main']}"] += 1
-
-    print(f"{'dimension':<24}{'main-frame acc':>15}{'either-frame acc':>18}")
-    overall_n = overall_main = overall_either = 0
-    for dim, c in sorted(dim_totals.items()):
-        print(f"{dim:<24}{c['main']/c['n']:>14.1%}{c['either']/c['n']:>17.1%}  (n={c['n']})")
-        overall_n += c["n"]; overall_main += c["main"]; overall_either += c["either"]
-    if overall_n:
-        print(f"{'OVERALL':<24}{overall_main/overall_n:>14.1%}{overall_either/overall_n:>17.1%}")
-
-    print("\nConfusion (gold -> detected main), top entries per dimension:")
-    for dim, c in sorted(confusion.items()):
-        top = ", ".join(f"{k} x{v}" for k, v in c.most_common(3))
-        print(f"  {dim}: {top}")
-
-
-def _acc(rows: list[dict]) -> float | None:
-    scored = [r for r in rows if r.get("prediction")]
-    if not scored:
-        return None
-    return sum(r["prediction"] == r["gold"] for r in scored) / len(scored)
-
-
-def report_ablation() -> None:
-    rows = ResumeLog(results_path("ablation.jsonl")).load_all()
-    if not rows:
-        print("ablation.jsonl: no results yet")
-        return
-    print(f"\n== Single-agent vs pipeline ablation ({len(rows)} runs) ==")
-    by_arm: dict[str, list[dict]] = defaultdict(list)
-    for r in rows:
-        by_arm[r.get("arm", "?")].append(r)
-
-    for arm, arm_rows in sorted(by_arm.items()):
-        errors = sum(1 for r in arm_rows if r.get("error"))
-        unparsed = sum(1 for r in arm_rows if not r.get("prediction") and not r.get("error"))
-        # Accuracy per repeat -> mean ± std across repeats.
-        by_rep: dict[int, list[dict]] = defaultdict(list)
-        for r in arm_rows:
-            by_rep[r.get("repeat", 0)].append(r)
-        rep_accs = [a for a in (_acc(v) for v in by_rep.values()) if a is not None]
-        if rep_accs:
-            mean = statistics.mean(rep_accs)
-            std = statistics.stdev(rep_accs) if len(rep_accs) > 1 else 0.0
-            print(f"\n[{arm}] accuracy: {mean:.1%} ± {std:.1%} "
-                  f"({len(arm_rows)} runs, {errors} errors, {unparsed} unparseable)")
+        gold = row.get("gold")
+        if gold is None:
+            continue
+        if key == "prediction":
+            pred = row.get("prediction")
         else:
-            print(f"\n[{arm}] no scoreable runs ({errors} errors)")
-
-        # Per-country parity: accuracy spread across countries with >=2 runs.
-        by_country: dict[str, list[dict]] = defaultdict(list)
-        for r in arm_rows:
-            by_country[r.get("country", "?")].append(r)
-        country_accs = {
-            c: _acc(v) for c, v in by_country.items() if len(v) >= 2 and _acc(v) is not None
-        }
-        if country_accs:
-            lo_c = min(country_accs, key=country_accs.get)
-            hi_c = max(country_accs, key=country_accs.get)
-            print(f"  parity across {len(country_accs)} countries: "
-                  f"min {country_accs[lo_c]:.0%} ({lo_c}), max {country_accs[hi_c]:.0%} ({hi_c}), "
-                  f"gap {country_accs[hi_c]-country_accs[lo_c]:.0%}")
-
-        if arm == "pipeline":
-            calls = [r["llm_calls"] for r in arm_rows if r.get("llm_calls")]
-            if calls:
-                print(f"  llm calls/scenario: mean {statistics.mean(calls):.0f} "
-                      f"(min {min(calls)}, max {max(calls)})")
-            reasons = Counter(r.get("convergence_reason") for r in arm_rows
-                              if r.get("convergence_reason"))
-            if reasons:
-                print(f"  convergence reasons: {dict(reasons)}")
-            leaky = [r for r in arm_rows if r.get("leak_phrases_found")]
-            if leaky:
-                phrases = Counter(p for r in leaky for p in r["leak_phrases_found"])
-                print(f"  LEAK-PHRASE REGRESSION: {len(leaky)} document(s) leaked "
-                      f"internal rubric text: {dict(phrases)}")
-            else:
-                print("  leak-phrase check: clean (no internal rubric text in documents)")
+            head = row.get(key) or {}
+            pred = head.get("label") if isinstance(head, dict) else None
+        out.append((gold, pred))
+    return out
 
 
-if __name__ == "__main__":
-    report_frame_eval()
-    report_ablation()
+def build(rows: Sequence[dict], vocab, config: dict | None = None,
+          seed: int = 0) -> dict:
+    labels = list(vocab.labels) if hasattr(vocab, "labels") else list(vocab["labels"])
+    usable = [r for r in rows if r.get("gold") is not None]
+
+    systems = {"thirdspace": metrics.evaluate(_pairs(usable, "prediction"), labels, seed)}
+    for head in ("structural", "readout", "baseline"):
+        if any(isinstance(r.get(head), dict) for r in usable):
+            systems[head] = metrics.evaluate(_pairs(usable, head), labels, seed)
+
+    comparison = {}
+    if "baseline" in systems:
+        comparison["thirdspace_vs_baseline"] = metrics.mcnemar(
+            _pairs(usable, "prediction"), _pairs(usable, "baseline"))
+    if "structural" in systems and "readout" in systems:
+        comparison["structural_vs_readout_agreement"] = metrics.agreement_rate(
+            [p for _, p in _pairs(usable, "structural")],
+            [p for _, p in _pairs(usable, "readout")])
+
+    errors = [r for r in usable if r.get("error")]
+    sig = [r.get("signals") or {} for r in usable if r.get("signals")]
+
+    def _mean(field: str) -> float:
+        vals = [float(s.get(field, 0) or 0) for s in sig]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    cost = {
+        "records": len(usable),
+        "failed_records": len(errors),
+        "llm_calls_total": sum(int(r.get("llm_calls") or 0) for r in usable),
+        "llm_calls_per_record": (
+            sum(int(r.get("llm_calls") or 0) for r in usable) / len(usable)) if usable else 0,
+        "tokens_total": sum(int(r.get("total_tokens") or 0) for r in usable),
+        "tokens_per_record": (
+            sum(int(r.get("total_tokens") or 0) for r in usable) / len(usable)) if usable else 0,
+        "wall_seconds_total": sum(float(r.get("wall_seconds") or 0) for r in usable),
+    }
+
+    diagnostics = {
+        "mean_conflicts": _mean("n_conflicts"),
+        "mean_agreements": _mean("n_agreements"),
+        "mean_severity": _mean("mean_severity"),
+        "mean_norm_pressure": _mean("norm_pressure"),
+        "mean_agreement_ratio": _mean("agreement_ratio"),
+        "dominant_type_distribution": dict(
+            Counter(s.get("dominant_type") for s in sig if s.get("dominant_type"))),
+        "convergence_reason_distribution": dict(
+            Counter(s.get("convergence_reason") for s in sig)),
+        # Does the pipeline's own conflict typing separate the gold classes at
+        # all? If the dominant type is identical for every gold label, the
+        # structural head has nothing to work with and that is worth knowing
+        # regardless of what accuracy came out.
+        "dominant_type_by_gold": _cross(usable, "dominant_type"),
+    }
+
+    slices = metrics.by_slice(usable, labels, key="group")
+
+    # Per-record labels. The aggregates say how often the heads were right;
+    # this says WHERE they disagreed, which is the part worth reading — a
+    # record all three heads get wrong is a hard case, while one where the
+    # free structural rule dissents from the paid read-out is a threshold
+    # problem. Without it a run has to be reconstructed from predictions.jsonl
+    # by hand.
+    records = []
+    for r in usable:
+        heads = {h: (r.get(h) or {}).get("label") for h in
+                 ("baseline", "readout", "structural")}
+        present = [v for h, v in heads.items() if isinstance(r.get(h), dict)]
+        records.append({
+            "record_id": r.get("record_id"),
+            "group": r.get("group", ""),
+            "gold": r.get("gold"),
+            "prediction": r.get("prediction"),
+            "correct": r.get("correct"),
+            "source": r.get("prediction_source"),
+            **heads,
+            # How many of the heads that actually ran landed on the same answer
+            # as the final prediction.
+            "heads_ran": len(present),
+            "heads_agreeing": sum(1 for v in present if v == r.get("prediction")),
+            "dominant_type": (r.get("signals") or {}).get("dominant_type"),
+            "n_conflicts": (r.get("signals") or {}).get("n_conflicts"),
+            "rationale": (r.get("prediction_rationale") or "")[:160],
+        })
+
+    return {"config": config or {}, "labels": labels, "systems": systems,
+            "comparison": comparison, "cost": cost, "diagnostics": diagnostics,
+            "slices": slices, "records": records,
+            "errors": [{"record_id": r["record_id"], "error": r["error"]} for r in errors][:20]}
+
+
+def _cross(rows: Sequence[dict], signal_field: str) -> dict:
+    out: dict[str, dict[str, int]] = {}
+    for row in rows:
+        gold = row.get("gold")
+        value = (row.get("signals") or {}).get(signal_field)
+        if gold is None or value is None:
+            continue
+        out.setdefault(gold, {})
+        out[gold][value] = out[gold].get(value, 0) + 1
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    lines = ["| " + " | ".join(headers) + " |",
+             "|" + "|".join(["---"] * len(headers)) + "|"]
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\n".join(lines)
+
+
+def to_markdown(report: dict) -> str:
+    cfg = report.get("config", {}).get("config", report.get("config", {}))
+    labels = report["labels"]
+    parts: list[str] = []
+
+    parts.append(f"# ThirdSpace evaluation — {cfg.get('dataset', '?')}\n")
+    parts.append(
+        f"n={cfg.get('n')} · classifier={cfg.get('classifier')} · "
+        f"max_cycles={cfg.get('max_cycles')} · seed={cfg.get('seed')} · "
+        f"stratified={cfg.get('stratify')}\n")
+
+    rows = []
+    for name, m in report["systems"].items():
+        lo, hi = m["accuracy_ci95"]
+        rows.append([
+            name, m["n_scored"], f"{m['accuracy']:.3f}", f"[{lo:.2f}, {hi:.2f}]",
+            f"{m['balanced_accuracy']:.3f}", f"{m['macro_f1']:.3f}",
+            f"{m['cohen_kappa']:.3f}", m["n_abstained"],
+        ])
+    majority = next(iter(report["systems"].values()))["majority_baseline"]
+    parts.append("## Headline\n")
+    parts.append(_table(
+        ["system", "scored", "accuracy", "95% CI", "balanced acc", "macro F1",
+         "kappa", "abstained"], rows))
+    parts.append(
+        f"\nAlways predicting `{majority['label']}` scores "
+        f"{majority['accuracy']:.3f} on this sample. Any system at or below "
+        f"that has learned nothing from the data.\n")
+
+    main = report["systems"]["thirdspace"]
+    parts.append("## Per class (ThirdSpace)\n")
+    parts.append(_table(
+        ["label", "precision", "recall", "F1", "support"],
+        [[l, f"{s['precision']:.2f}", f"{s['recall']:.2f}", f"{s['f1']:.2f}", s["support"]]
+         for l, s in main["per_class"].items()]))
+
+    parts.append("\n## Confusion (rows = gold, cols = predicted)\n")
+    parts.append(_table(
+        ["gold \\ pred"] + labels,
+        [[g] + [main["confusion"][g][p] for p in labels] for g in labels]))
+
+    comp = report.get("comparison", {})
+    if comp:
+        parts.append("\n## Comparison\n")
+        mn = comp.get("thirdspace_vs_baseline")
+        if mn:
+            parts.append(
+                f"- McNemar vs single-call baseline on {mn['n_compared']} paired records: "
+                f"ThirdSpace-only-correct={mn['a_only']}, baseline-only-correct={mn['b_only']}, "
+                f"p={mn['p_value']:.3f}.")
+        agree = comp.get("structural_vs_readout_agreement")
+        if agree is not None:
+            parts.append(
+                f"- Structural and read-out heads agree on {agree:.1%} of records. "
+                f"High agreement means the free head can replace the paid one.")
+
+    d = report["diagnostics"]
+    parts.append("\n## Pipeline diagnostics\n")
+    parts.append(_table(
+        ["signal", "mean"],
+        [["conflicts per record", f"{d['mean_conflicts']:.1f}"],
+         ["agreements per record", f"{d['mean_agreements']:.1f}"],
+         ["mean conflict severity", f"{d['mean_severity']:.2f}"],
+         ["norm pressure", f"{d['mean_norm_pressure']:.2f}"],
+         ["agreement ratio", f"{d['mean_agreement_ratio']:.2f}"]]))
+    parts.append(f"\nDominant conflict type overall: `{d['dominant_type_distribution']}`")
+    parts.append(f"\nDominant conflict type by gold label: `{d['dominant_type_by_gold']}`")
+    parts.append(f"\nTermination reasons: `{d['convergence_reason_distribution']}`")
+
+    c = report["cost"]
+    parts.append("\n## Cost\n")
+    parts.append(_table(
+        ["metric", "value"],
+        [["records", c["records"]],
+         ["failed records", c["failed_records"]],
+         ["LLM calls (total)", c["llm_calls_total"]],
+         ["LLM calls per record", f"{c['llm_calls_per_record']:.1f}"],
+         ["tokens (total)", f"{c['tokens_total']:,}"],
+         ["tokens per record", f"{c['tokens_per_record']:,.0f}"],
+         ["wall clock (s)", f"{c['wall_seconds_total']:.0f}"]]))
+
+    recs = report.get("records") or []
+    if recs:
+        # Only show head columns that actually ran, so a structural-only run
+        # does not print three columns of None.
+        heads = [h for h in ("baseline", "readout", "structural")
+                 if any(r.get(h) is not None for r in recs)]
+        parts.append("\n## Per record\n")
+        parts.append(
+            "`✓`/`✗` marks each head against gold. `dissent` counts heads that "
+            "answered differently from the final prediction — those are the "
+            "records worth opening.\n")
+        header = ["record", "group", "gold"] + heads + ["final", "dissent", "conflicts", "type"]
+        body = []
+        for r in recs:
+            row = [str(r["record_id"]), str(r.get("group") or "—"), str(r["gold"])]
+            for h in heads:
+                v = r.get(h)
+                row.append("—" if v is None
+                           else f"{v} {'✓' if v == r['gold'] else '✗'}")
+            final = r.get("prediction")
+            row.append("—" if final is None
+                       else f"{final} {'✓' if r.get('correct') else '✗'}")
+            row.append(str(r["heads_ran"] - r["heads_agreeing"]))
+            row.append(str(r.get("n_conflicts") if r.get("n_conflicts") is not None else "—"))
+            row.append(str(r.get("dominant_type") or "—"))
+            body.append(row)
+        parts.append(_table(header, body))
+
+    if report.get("slices"):
+        parts.append("\n## By slice\n")
+        parts.append(_table(
+            ["slice", "n", "accuracy", "macro F1"],
+            [[k, v["n"], f"{v['accuracy']:.2f}", f"{v['macro_f1']:.2f}"]
+             for k, v in report["slices"].items()]))
+
+    if report.get("errors"):
+        parts.append("\n## Failures\n")
+        for e in report["errors"]:
+            parts.append(f"- `{e['record_id']}`: {e['error']}")
+
+    return "\n".join(parts) + "\n"
+
+
+def write(report: dict, run_dir: Path) -> tuple[Path, Path]:
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    json_path = run_dir / "report.json"
+    md_path = run_dir / "report.md"
+    json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    md_path.write_text(to_markdown(report), encoding="utf-8")
+    return md_path, json_path

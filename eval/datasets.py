@@ -98,15 +98,24 @@ CANON_REJECT = "unacceptable"
 CANON_UNSETTLED = "contested"
 
 _ALIASES: dict[str, str] = {}
+# "adhere"/"violate"/"neither" are the vocabulary of the pre-registered gold
+# file (eval/label_maps/normad_v1.yaml), which is the path that carries the
+# derived challenger_country. Without them every label canonicalizes to None,
+# vocab.for_canon returns None for every bucket, and the structural head
+# abstains on exactly the cases where its rule fires while emitting an
+# arbitrary label when nothing fires — silently inverted, not merely degraded.
 for _word in ("yes", "moral", "ethical", "acceptable", "permissible", "right",
-              "justified", "good", "approve", "approved", "true", "1"):
+              "justified", "good", "approve", "approved", "true", "1",
+              "adhere", "adheres", "adherence", "conform", "conforms", "complies"):
     _ALIASES[_word] = CANON_ACCEPT
 for _word in ("no", "immoral", "unethical", "unacceptable", "impermissible",
-              "wrong", "unjustified", "bad", "disapprove", "false", "0"):
+              "wrong", "unjustified", "bad", "disapprove", "false", "0",
+              "violate", "violates", "violation", "transgress", "transgresses"):
     _ALIASES[_word] = CANON_REJECT
 for _word in ("neutral", "grey", "gray", "grey area", "gray area", "ambiguous",
               "context dependent", "context-dependent", "depends", "unclear",
-              "mixed", "undecided", "indeterminate", "2"):
+              "mixed", "undecided", "indeterminate", "2",
+              "neither", "not engaged", "inapplicable", "n a"):
     _ALIASES[_word] = CANON_UNSETTLED
 
 
