@@ -53,6 +53,11 @@ _active_memory: contextvars.ContextVar["SessionMemory | None"] = contextvars.Con
     "thirdspace_active_memory", default=None,
 )
 
+# Guards the read-modify-write of the shared counters below. The cell agents
+# fan out ~84 calls per cycle across a ThreadPoolExecutor; without this lock the
+# `+= 1` / `+= tokens` increments race and silently under-count.
+_counter_lock = threading.Lock()
+
 
 def set_active_memory(memory: "SessionMemory | None") -> contextvars.Token:
     """Register the SessionMemory that should accumulate LLM telemetry.
@@ -87,14 +92,26 @@ def check_budget_before_call() -> None:
         )
 
 
-def record_success(latency_ms: int) -> None:
-    """Called by call_llm on a successful Bedrock response."""
+def record_success(latency_ms: int, usage: dict | None = None) -> None:
+    """Called by call_llm on a successful Bedrock response.
+
+    `usage` is the Bedrock `converse` usage block
+    ({"inputTokens", "outputTokens", "totalTokens"}); when present its token
+    counts are accumulated onto the active SessionMemory.
+    """
     mem = _active_memory.get()
     if mem is None:
         return
+    usage = usage or {}
+    in_tok = usage.get("inputTokens", 0) or 0
+    out_tok = usage.get("outputTokens", 0) or 0
+    tot_tok = usage.get("totalTokens", 0) or (in_tok + out_tok)
     with _counter_lock:
         mem.llm_calls_made += 1
         mem.total_latency_ms += latency_ms
+        mem.total_input_tokens += in_tok
+        mem.total_output_tokens += out_tok
+        mem.total_tokens += tot_tok
         mem.consecutive_failures = 0
         # Post-increment guard: check_budget_before_call is intentionally
         # lock-free (locking 84 cell calls through one chokepoint would kill the

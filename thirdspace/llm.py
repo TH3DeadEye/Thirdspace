@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import time
 import logging
 from typing import Any
@@ -8,13 +9,14 @@ from functools import lru_cache
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from json_repair import repair_json
 from langsmith import traceable
 from langsmith.run_helpers import get_current_run_tree
 
 from budget import (
     check_budget_before_call, record_success, record_failure,
 )
-from utils.parsing import _candidate_blocks, _count_sentences
+from utils.parsing import _candidate_blocks
 
 logger = logging.getLogger(__name__)
 #main agent LLM model 
@@ -113,7 +115,7 @@ def call_llm(
     user: str,
     model: str = BEDROCK_MODEL_ID,
     max_tokens: int = 8000,
-    retries: int = 3,
+    retries: int = 6,
     temperature:float = 0.3,
 ) -> str:
     # Budget guard: refuse to issue the call if the scenario is out of budget.
@@ -147,16 +149,22 @@ def call_llm(
                     f"Response hit maxTokens={max_tokens} and was truncated; "
                     f"downstream JSON parsing may fail. Raise max_tokens if this recurs."
                 )
-            record_success(latency_ms)
+            usage = response.get("usage", {})
+            record_success(latency_ms, usage)
             _annotate_llm_run(
-                model, response.get("usage", {}), temperature, max_tokens, latency_ms
+                model, usage, temperature, max_tokens, latency_ms
             )
             return text
         except ClientError as e:
             code = e.response["Error"]["Code"]
             if code in ("ThrottlingException", "TooManyRequestsException"):
-                wait = 2 ** attempt * 5
-                logger.warning(f"Throttled, waiting {wait}s (attempt {attempt+1}/{retries})")
+                # Exponential backoff capped at 60s, plus full jitter. The cell
+                # agents fire many calls at once; without jitter their retries
+                # re-synchronize and slam the same per-minute quota together.
+                wait = min(60, 2 ** attempt * 5) + random.uniform(0, 5)
+                logger.warning(
+                    f"Throttled, waiting {wait:.1f}s (attempt {attempt+1}/{retries})"
+                )
                 time.sleep(wait)
             elif code == "ValidationException":
                 logger.error(f"Bedrock validation error: {e}")
@@ -219,7 +227,10 @@ def embed_text(
                 )
                 time.sleep(2 ** attempt)
                 continue
-            record_success(latency_ms)
+            record_success(
+                latency_ms,
+                {"inputTokens": payload.get("inputTextTokenCount", 0) or 0},
+            )
             return embedding
         except ClientError as e:
             code = e.response["Error"]["Code"]
@@ -278,9 +289,30 @@ def call_llm_json(system: str, user: str, **kwargs) -> Any:
                 first_error = e
             continue
 
+    # Strict parsing failed on every candidate. Fall back to json_repair, a
+    # tolerant parser that fixes the malformations Claude actually produces but
+    # strict JSON cannot: unescaped inner quotes (e.g. echoing a phrase like
+    # "green light" inside a content string), trailing commas, and truncated
+    # tails. We only reach here on genuinely broken output, so a heuristic
+    # recovery is strictly better than crashing the whole run.
+    for block in _candidate_blocks(raw):
+        try:
+            repaired = repair_json(block, return_objects=True)
+        except Exception:
+            continue
+        # Our prompts always return an object or array; a non-empty dict/list
+        # means json_repair recovered something usable. Anything else (""/{}/[])
+        # is a failed recovery — try the next candidate.
+        if isinstance(repaired, (dict, list)) and repaired:
+            logger.warning(
+                "Strict JSON parse failed (%s); recovered with json_repair.",
+                first_error,
+            )
+            return repaired
+
     logger.error(
-        "Model response was not valid JSON (length=%d chars). If the snippet "
-        "below looks cut off, the call likely hit maxTokens and was truncated.\n%s",
+        "Model response was not valid JSON and json_repair could not recover it "
+        "(length=%d chars). First 1500 chars:\n%s",
         len(raw), raw[:1500],
     )
     raise ValueError(
@@ -292,63 +324,68 @@ def call_llm_json(system: str, user: str, **kwargs) -> Any:
 # Context engineering utilities (from Omid's context engineering update)
 # ---------------------------------------------------------------------------
 
-# Reflection measure → corrective instruction.
-# Used by call_llm_json_with_refinement when a cell flags a failed measure.
-REFLECTION_INSTRUCTIONS: dict[str, str] = {
-    "clarity": (
-        "Reflect on Clarity: Is this completely clear and unambiguous? "
-        "Paraphrase the core argument and bring concrete examples to ground it."
-    ),
-    "correctness": (
-        "Reflect on Correctness: Is this assessment accurate and objective? "
-        "Ensure the analysis has not been misled by the narrator's emotional framing."
-    ),
-    "precision": (
-        "Reflect on Precision: Is this too vague or generalized? "
-        "Bring specific granular details and be explicitly descriptive about the dynamics."
-    ),
-    "proportion": (
-        "Reflect on Proportion: Is this directly related to the core conflict? "
-        "Analyze how heavily this point affects the overall result."
-    ),
-    "depth": (
-        "Reflect on Depth: Have you bypassed the underlying complexities? "
-        "Address structural difficulties and root causes, not just the surface."
-    ),
-    "comprehensiveness": (
-        "Reflect on Comprehensiveness: Are you missing critical perspectives? "
-        "State how this moment appears from the opposing cultural frame."
-    ),
-    "logic": (
-        "Reflect on Logic: Is this a valid deductive step? "
-        "Verify that the observations actually imply this result."
-    ),
-    "fairness": (
-        "Reflect on Fairness: Have all viewpoints been treated in a balanced way? "
-        "Audit for bias or quietly altered details that favor one frame."
-    ),
-}
+# Refinement retry cap. Retries fire only on structural defects (an empty or
+# placeholder answer), which are rare — reflection_flags are telemetry, not
+# failures, so they never trigger a retry. Tune via env if needed.
+MAX_REFINE_ATTEMPTS = int(os.environ.get("THIRDSPACE_REFINE_ATTEMPTS", "2"))
+
+
+# Below this length a response is a placeholder ("", "N/A", "none"), not a
+# short answer. This is NOT a length target: cells are asked for AT MOST six
+# sentences, and one precise sentence is a valid cell.
+MIN_CELL_CONTENT_CHARS = 40
+
+
+def _structural_issues(result: dict) -> list[str]:
+    """Objective defects that justify paying for a retry call.
+
+    Deliberately narrow, in two ways.
+
+    Populated reflection_flags are NOT failures. An honest model asked to
+    self-criticize always finds something (run-june-10-1: 126/126 cells retried
+    on their own honesty, 49% of the run's calls, and 155 cells still carried
+    flags afterwards). Flags are kept on the result as downstream context.
+
+    Neither is brevity. We retry on an ABSENT answer, never on a short one. The
+    old rule retried anything under three sentences, which paid for a full call
+    to pad a cell that had already said its one true thing — and padding is
+    what the cell prompts' own "a cell that could be pasted into any other cell
+    has failed" rule exists to prevent.
+    """
+    content = str(result.get("content", "") or "").strip()
+    if not content:
+        return ["The 'content' field is empty. Write it, in no more than six sentences."]
+    if len(content) < MIN_CELL_CONTENT_CHARS:
+        return [
+            f"The 'content' field is {len(content)} characters — a placeholder, "
+            f"not a reading. Give the actual reasoning for this cell, in no "
+            f"more than six sentences."
+        ]
+    return []
 
 
 @traceable(run_type="chain", name="cell_refinement")
 def call_llm_json_with_refinement(
     system: str,
     user: str,
-    max_refine_attempts: int = 2,
+    max_refine_attempts: int = MAX_REFINE_ATTEMPTS,
     **kwargs,
 ) -> Any:
     """
-    Wraps call_llm_json with a validation and self-correction loop.
+    Wraps call_llm_json with a structural validation and retry loop.
 
     Used for single-cell calls (CT agent and Challenger).
     Each call returns {"content": "...", "reflection_flags": [...], ...}.
 
-    Checks:
-    - content exists and has at least 3 sentences
-    - reflection_flags are addressed with corrective prompts on retry
+    Retries ONLY on objective structural defects (an empty or placeholder
+    answer — see _structural_issues). Brevity is not a defect, and
+    reflection_flags are self-reported nuance, not defects: both stay on the
+    result untouched and never trigger a retry.
 
-    If validation passes, returns immediately. If it fails, injects specific
-    corrective feedback and retries up to max_refine_attempts times.
+    The retry prompt is context-complete: it contains the ORIGINAL user prompt
+    (The Occurring etc.), the model's previous response, and the feedback —
+    a bare "fix it" retry regenerates from the system prompt alone, with no
+    scenario in front of the model.
 
     The returned dict has an extra non-LLM key `_refinement_meta` with:
       {"attempts": int, "reasons": list[str]}
@@ -367,57 +404,34 @@ def call_llm_json_with_refinement(
     attempts = 0
     reasons: list[str] = []
 
-    for attempt in range(max_refine_attempts):
-        issues = []
-
-        content = result.get("content", "").strip()
-        if not content:
-            issues.append("The 'content' field is empty. Write 3 to 6 sentences.")
-        else:
-            sentence_count = _count_sentences(content)
-            if sentence_count < 3:
-                issues.append(
-                    f"Content has only {sentence_count} sentence(s). "
-                    f"Write at least 3 sentences."
-                )
-
-        for flag in result.get("reflection_flags", []):
-            if isinstance(flag, dict):
-                measure = flag.get("measure", "").lower().strip()
-                issue = flag.get("issue", "Unspecified failure")
-                instruction = REFLECTION_INSTRUCTIONS.get(
-                    measure,
-                    "Review the depth, fairness, and structural validity of this entry.",
-                )
-                issues.append(
-                    f"Self-evaluation failed [{measure.upper()}]: {issue}\n"
-                    f"Correction required: {instruction}"
-                )
-
+    for _ in range(max_refine_attempts):
+        issues = _structural_issues(result)
         if not issues:
-            result["_refinement_meta"] = {"attempts": attempts, "reasons": reasons}
-            return result
+            break
 
         attempts += 1
-        # Capture short, structured reasons for telemetry (the full prompt
-        # feedback is too verbose to persist on every cell).
-        for issue in issues:
-            first_line = issue.splitlines()[0]
-            reasons.append(first_line)
-
+        reasons.extend(issues)
         logger.warning(
-            f"[Refinement attempt {attempt + 1}] {len(issues)} issue(s) found, retrying."
+            f"[Refinement attempt {attempts}] {len(issues)} structural issue(s), retrying."
         )
-        feedback = "\n".join(issues[:5])
-        if len(issues) > 5:
-            feedback += f"\n...and {len(issues) - 5} more."
+        feedback = "\n".join(issues)
 
         refine_user = (
-            f"Your previous response failed validation:\n\n{feedback}\n\n"
-            f"Correct your response. Apply the correction directives above. "
-            f"Write 3 to 6 sentences. Return valid JSON."
+            f"{user}\n\n"
+            f"--- YOUR PREVIOUS RESPONSE ---\n"
+            f"{json.dumps(result, ensure_ascii=False)}\n\n"
+            f"--- VALIDATION FEEDBACK ---\n"
+            f"{feedback}\n\n"
+            f"Rewrite your previous response so it fixes the feedback while "
+            f"keeping everything that was already correct. Write no more than "
+            f"six sentences. Return valid JSON in the same format."
         )
         result = call_llm_json(system, refine_user, **kwargs)
+        if not isinstance(result, dict):
+            raise ValueError(
+                f"call_llm_json_with_refinement expects a JSON object but got "
+                f"{type(result).__name__}: {str(result)[:200]}"
+            )
 
     result["_refinement_meta"] = {"attempts": attempts, "reasons": reasons}
     return result

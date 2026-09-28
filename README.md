@@ -196,7 +196,6 @@ python -m unittest discover -s tests -v
 |---|---|---|
 | `max_cycles` | `3` | Maximum reasoning cycles |
 | `max_regen` | `1` | Maximum output regenerations |
-| `output_score_threshold` | `3` | Judge score below this → regenerate |
 | `consensus_plateau_threshold` | `4` | Secondary convergence signal |
 | `llm_call_budget` | `1000` | Hard cap on LLM calls per scenario |
 | `max_consecutive_failures` | `5` | Circuit-breaker threshold |

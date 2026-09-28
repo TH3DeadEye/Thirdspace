@@ -1,0 +1,51 @@
+# AITA / Moral Dilemma Dataset verdict -> ThirdSpace five-type conflict taxonomy.
+#
+# STATUS: STUB, frozen in advance of the (deferred) Pairing 1 run. The AITA
+# pairing needs the Moral Dilemma Dataset to be acquired first; this mapping is
+# committed now so it is demonstrably pre-registered — written before any AITA
+# scoring run existed. If it needs revision, create aita_v2.yaml; do not edit.
+#
+# This mapping is DELIBERATELY LOSSY and each decision is justified below,
+# because AITA's five-way community verdict is a fault allocation, not a
+# conflict typology. Expect a reviewer to probe exactly this table.
+
+version: 1
+dataset: "Moral Dilemma Dataset (AITA), 2025 — 22,451 posts, 684,360 comments"
+gold_column: verdict
+prediction_source: ImplyingNodes.conflict_type_summary.dominant_type
+
+mapping:
+  # YTA / NTA: the community allocated fault to one party. A fault allocation
+  # presupposes the parties dispute who caused the harm — ThirdSpace's
+  # attributional type (shared facts, disputed causal responsibility).
+  # LOSSY: the verdict says who was judged at fault; the type only says fault
+  # allocation is the axis. Direction of fault is not recoverable from
+  # dominant_type and is not scored.
+  YTA: attributional
+  NTA: attributional
+  # NAH: "no assholes here" — nobody is at fault; the conflict dissolves under
+  # clarification. Closest to semantic (same words, different operational
+  # meanings; resolvable conversationally).
+  # LOSSY: some NAH verdicts reflect genuine value differences amicably held,
+  # which would be normative. Accepted as noise in v1; a secondary annotation
+  # pass may split NAH in v2.
+  NAH: semantic
+  # ESH: "everyone sucks here" — both positions defensible/blameworthy; the
+  # verdict alone cannot distinguish incompatible values (normative) from a
+  # situation that produces the conflict regardless of occupants (structural).
+  # Rather than guess, ESH items REQUIRE a secondary annotation pass that
+  # assigns normative vs structural per item BEFORE scoring. Unannotated ESH
+  # items are excluded, not force-mapped.
+  ESH: requires_secondary_annotation   # -> normative | structural per item
+  # INFO: "not enough info" — no verdict exists; there is nothing to score
+  # against. Excluded rather than forced into a category.
+  INFO: excluded
+
+prediction_classes: [semantic, attributional, normative, structural, factual]
+
+notes: |
+  factual has no AITA source class: the community votes on morality given the
+  narrator's account, not on what happened. A factual dominant_type prediction
+  on an AITA item therefore counts against every mapped gold class — that is
+  intentional, not an oversight (the pipeline claiming "they dispute the bare
+  facts" about a story the community found judgeable is a real error signal).

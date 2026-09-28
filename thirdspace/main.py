@@ -10,6 +10,7 @@ from models import SessionMemory, TheOccurring, CultureAxis, CulturalFrame
 from graph import build_graph
 from budget import set_active_memory, reset_active_memory
 from utils.prompts import render_frame
+from verify import verify_session, format_report
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,13 +43,27 @@ def _make_scenario_id(
     raw_scenario: str,
     main_frame: CulturalFrame | None,
     challenger_frame: CulturalFrame | None,
+    max_cycles: int = 0,
+    mediator_frame: str = "",
 ) -> str:
-    """Deterministic 12-char id from the inputs, so re-running the same scenario
-    writes to the same output file (reproducible; no orphaned partial runs).
+    """Deterministic 12-char id from everything that changes the result.
+
+    Re-running an identical configuration writes to the same output file
+    (reproducible; no orphaned partial runs), but a DIFFERENT configuration must
+    get a different file. The run parameters used to be excluded, so a 1-cycle and
+    a 3-cycle run of the same scenario overwrote each other's session JSON —
+    destroying exactly the comparison an ablation exists to make.
+
     Frames are rendered first so a dimensional frame and its string form produce
-    stable, comparable ids. In auto-detect mode (both frames None) the frames
-    aren't known yet, so the id hashes the raw scenario alone."""
-    content = f"{raw_scenario}|{render_frame(main_frame)}|{render_frame(challenger_frame)}"
+    stable, comparable ids.
+    """
+    content = "|".join([
+        raw_scenario,
+        render_frame(main_frame),
+        render_frame(challenger_frame),
+        f"cycles={max_cycles}",
+        f"mediator={mediator_frame}",
+    ])
     return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 
@@ -57,45 +72,50 @@ def run_scenario(
     main_cultural_frame: CulturalFrame | None = None,
     challenger_cultural_frame: CulturalFrame | None = None,
     max_cycles: int = 3,
-    challenger_style: str | None = None,
     mediator_frame: str | None = None,
+    skip_generation: bool = False,
     output_dir: Path | None = DEFAULT_OUTPUT_DIR,
 ) -> SessionMemory:
-    # Frame mode is inferred from what the caller passed:
-    #   both None -> auto-detect (production: user submits only a scenario)
-    #   "" / []   -> neutral (deliberate no-frame baseline)
-    #   otherwise -> explicit (use the given frames as-is)
-    # "" and None are distinct signals: "" means "run with no frame", None means
-    # "decide the frame for me". A lone None coerces to "" (neutral for that side).
-    auto = main_cultural_frame is None and challenger_cultural_frame is None
-    if not auto:
-        main_cultural_frame = "" if main_cultural_frame is None else main_cultural_frame
-        challenger_cultural_frame = (
-            "" if challenger_cultural_frame is None else challenger_cultural_frame
-        )
+    """Run one scenario end to end and return the completed SessionMemory.
+
+    Frames are always supplied by the caller — there is no inference step.
+    Evaluation runs read them from the dataset (NormAd -> country, MDD ->
+    active/passive agent) via prompts.read_cultural_frames. Passing None (or "")
+    for a side puts that agent in NEUTRAL mode, where the prompt drops its frame
+    block entirely rather than rendering an empty one.
+
+    skip_generation stops the run after the loop. It defaults to False here AND on
+    SessionMemory — the two used to disagree (False here, True there), so the same
+    switch meant opposite things depending on how a run was constructed. Generating
+    is the default because the document is the system's output; the evaluation
+    runners whose classifiers read the mediation instead pass skip_generation=True
+    explicitly, at the call site where the money is spent.
+    """
+    # A lone None coerces to "" — neutral for that side.
+    main_cultural_frame = "" if main_cultural_frame is None else main_cultural_frame
+    challenger_cultural_frame = (
+        "" if challenger_cultural_frame is None else challenger_cultural_frame
+    )
 
     scenario_id = _make_scenario_id(
-        raw_scenario, main_cultural_frame, challenger_cultural_frame
+        raw_scenario, main_cultural_frame, challenger_cultural_frame,
+        max_cycles=max_cycles, mediator_frame=mediator_frame or "",
     )
     fields = {
         "scenario_id": scenario_id,
-        # In auto mode these start as placeholders; node_detect_frames overwrites
-        # them and sets the structured identities before reformulation. In the
-        # explicit/neutral path, SessionMemory.derive_identities builds the typed
-        # CulturalIdentity from these frames; the challenger working perspective
-        # starts empty (prose=None) and the loop refines it without touching identity.
-        "main_cultural_frame": "" if auto else main_cultural_frame,
-        "challenger_cultural_frame": "" if auto else challenger_cultural_frame,
-        "auto_detect_frames": auto,
+        # SessionMemory.derive_identities builds the typed CulturalIdentity from
+        # these frames. The challenger's working perspective starts empty
+        # (prose=None); the loop refines it without ever touching the identity.
+        "main_cultural_frame": main_cultural_frame,
+        "challenger_cultural_frame": challenger_cultural_frame,
         "occurring": TheOccurring(
             scenario_id=scenario_id,
             raw_scenario=raw_scenario,
             nodes=[],
         ),
         "max_cycles": max_cycles,
+        "skip_generation": skip_generation,
     }
-    if challenger_style is not None:
-        fields["challenger_style"] = challenger_style
     if mediator_frame is not None:
         fields["mediator_frame"] = mediator_frame
     memory = SessionMemory(**fields)
@@ -123,6 +143,15 @@ def run_scenario(
     finally:
         reset_active_memory(token)
     final = result["memory"]
+
+    # Invariant check before persisting: costs nothing, and turns "the run
+    # finished" into "the run finished and is internally consistent". Never fatal
+    # — a completed run is worth keeping even when a check fails, and the report
+    # travels with the session so the failure cannot be missed later.
+    problems = verify_session(final)
+    logger.log(logging.WARNING if problems else logging.INFO,
+               f"[{final.scenario_id}] {format_report(problems)}")
+
     if output_dir is not None:
         path = persist_session(final, output_dir)
         logger.info(f"[{final.scenario_id}] Persisted session to {path}")
@@ -144,60 +173,62 @@ to me. I paid my fair share, I didn't freeload, and I even added extra to thank 
 I genuinely do not understand what I did wrong.
     """
 
-    # Frames accept four forms (see models.CulturalFrame + run_scenario):
+    # Frames are always supplied by the caller. Three forms:
     #
-    # 0. Auto-detect (PRODUCTION default) — pass no frames at all. Phase 0 infers
-    #    both frames from the scenario, constrained to CULTURE_DIMENSION_MENU
-    #    (Hofstede 6, binary high/low). The detected axes + rationale are saved to
-    #    outputs/{scenario_id}.json under frame_detection:
-    #        memory = run_scenario(raw_scenario=scenario, max_cycles=3)
+    # 1. Free-text label — what the datasets supply, and what is used below.
+    #    NormAd gives a country; MDD gives an agent description.
+    #        main_cultural_frame="germany", challenger_cultural_frame="jordan"
     #
-    # 1. Free-text label (back-compat) — used below.
-    #
-    # 2. Dimensional axes (matches the Hofstede fine-tune; less stereotyping):
+    # 2. Dimensional axes (matches the Hofstede vocabulary; less stereotyping):
     #    main_cultural_frame=[
     #        CultureAxis(dimension="power_distance", value="low"),
     #        CultureAxis(dimension="individualism", value="individualist"),
     #    ],
-    #    challenger_cultural_frame=[
-    #        CultureAxis(dimension="power_distance", value="high"),
-    #        CultureAxis(dimension="individualism", value="collectivist"),
-    #    ],
     #
-    # 3. Neutral baseline (no frame for either agent — drops the frame scaffolding
-    #    and the "name your frame" lines, to test the output-verbosity hypothesis).
-    #    Note: "" is DISTINCT from passing nothing — "" forces neutral, omitting
-    #    the args triggers auto-detect (form 0):
+    # 3. Neutral baseline — "" for either side drops that agent's frame block
+    #    entirely, so a no-frame run isolates the frame as an experimental
+    #    variable instead of leaving dangling references to a frame that was
+    #    never supplied:
     #        main_cultural_frame="", challenger_cultural_frame="",
     #
     # Convergence metric is selectable on SessionMemory (convergence_metric=
     # "embedding" default, or "jaccard"); run both to A/B the loop behavior.
     memory = run_scenario(
         raw_scenario=scenario,
-        max_cycles=2,
+        main_cultural_frame="germany",
+        challenger_cultural_frame="jordan",
+        # One cycle: multiple cycles at ~60 calls each cannot fit the account's
+        # Bedrock rate limit in any reasonable wall time. Raise after a quota bump.
+        max_cycles=1,
     )
 
-    print("\n" + "=" * 60)
-    print("FINAL OUTPUT")
-    print("=" * 60)
-    print(memory.final_output)
-
-    print("\n" + "=" * 60)
-    print("JUDGE SCORES")
-    print("=" * 60)
-    for score in memory.judge_scores:
-        print(f"Empathy:          {score.empathy}/5")
-        print(f"Consensus:        {score.consensus}/5")
-        print(f"Escalation Risk:  {score.escalation_risk}/5")
-        print(f"Cultural Insight: {score.cultural_insight}/5")
-        print(f"\nReasoning:\n{score.reasoning}")
+    if memory.final_output:
+        print("\n" + "=" * 60)
+        print("FINAL OUTPUT")
+        print("=" * 60)
+        print(memory.final_output)
 
     print("\n" + "=" * 60)
     print("SESSION SUMMARY")
     print("=" * 60)
-    print(f"Cycles completed:  {memory.current_cycle}")
-    print(f"Converged:         {memory.converged}")
+    print(f"Cycles completed:  {len(memory.mediation_history)}")
+    print(f"Converged:         {memory.converged} ({memory.convergence_reason})")
     if memory.mediation_history:
         last = memory.mediation_history[-1]
+        summary = last.conflict_type_summary
         print(f"Agreements found:  {len(last.agreements)}")
         print(f"Conflicts found:   {len(last.conflicts)}")
+        if summary:
+            print(f"Dominant type:     {summary.dominant_type}")
+            print(f"Type distribution: "
+                  f"{ {t: getattr(summary, t) for t in ('factual', 'procedural', 'interpretive',
+                       'power_related', 'identity_related', 'normative')} }")
+
+    print("\n" + "=" * 60)
+    print("TOKEN & CALL USAGE")
+    print("=" * 60)
+    print(f"LLM calls:         {memory.llm_calls_made}")
+    print(f"Input tokens:      {memory.total_input_tokens:,}")
+    print(f"Output tokens:     {memory.total_output_tokens:,}")
+    print(f"Total tokens:      {memory.total_tokens:,}")
+    print(f"Total latency:     {memory.total_latency_ms / 1000:.1f}s")
